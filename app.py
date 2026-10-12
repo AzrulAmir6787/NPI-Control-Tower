@@ -1,4 +1,5 @@
 import base64
+import hmac
 import html
 import io
 import math
@@ -37,6 +38,75 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# ============================================================
+# LOGIN / ACCESS GATE
+# ============================================================
+
+try:
+    LOGIN_USERNAME = str(
+        st.secrets["npi_login"]["username"]
+    )
+    LOGIN_PASSWORD = str(
+        st.secrets["npi_login"]["password"]
+    )
+
+except (FileNotFoundError, KeyError):
+    st.error(
+        "Login credentials are not configured. "
+        "Please contact the app owner."
+    )
+    st.stop()
+
+
+if "npi_authenticated" not in st.session_state:
+    st.session_state["npi_authenticated"] = False
+
+
+if not st.session_state["npi_authenticated"]:
+
+    st.title("NPI Control Tower")
+    st.caption("Please sign in to continue.")
+
+    with st.form("npi_login_form"):
+
+        username = st.text_input("Username")
+
+        password = st.text_input(
+            "Password",
+            type="password",
+        )
+
+        submitted = st.form_submit_button("Log in")
+
+    if submitted:
+
+        username_valid = hmac.compare_digest(
+            username.encode("utf-8"),
+            LOGIN_USERNAME.encode("utf-8"),
+        )
+
+        password_valid = hmac.compare_digest(
+            password.encode("utf-8"),
+            LOGIN_PASSWORD.encode("utf-8"),
+        )
+
+        if username_valid and password_valid:
+            st.session_state["npi_authenticated"] = True
+            st.rerun()
+
+        else:
+            st.error("Invalid username or password.")
+
+    st.stop()
+
+
+with st.sidebar:
+
+    if st.button("Log out"):
+        st.session_state["npi_authenticated"] = False
+        st.rerun()
 
 
 # ============================================================

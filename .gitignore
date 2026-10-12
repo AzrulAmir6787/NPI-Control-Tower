@@ -1,0 +1,10 @@
+
+# Local Streamlit credentials - never upload to GitHub
+.streamlit/secrets.toml
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local environment variables
+.env

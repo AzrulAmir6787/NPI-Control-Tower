@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NPI Control Tower Floating Dashboard</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; min-height: 100%; overflow: hidden; background: transparent; }
+  </style>
+  <script>
+    (function () {
+      "use strict";
+
+      function sendMessage(type, data) {
+        const message = Object.assign({
+          isStreamlitMessage: true,
+          type: type
+        }, data || {});
+        window.parent.postMessage(message, "*");
+      }
+
+      function rerunEmbeddedScripts() {
+        const scripts = Array.from(document.body.querySelectorAll("script"));
+        scripts.forEach(function (oldScript) {
+          const replacement = document.createElement("script");
+          Array.from(oldScript.attributes).forEach(function (attribute) {
+            replacement.setAttribute(attribute.name, attribute.value);
+          });
+          replacement.textContent = oldScript.textContent || "";
+          oldScript.replaceWith(replacement);
+        });
+      }
+
+      function renderComponent(args) {
+        const html = (args && typeof args.html === "string") ? args.html : "";
+        document.body.innerHTML = html;
+        rerunEmbeddedScripts();
+
+        const requestedHeight = Number(args && args.frame_height);
+        const frameHeight = Number.isFinite(requestedHeight) && requestedHeight > 0
+          ? requestedHeight
+          : 720;
+        sendMessage("streamlit:setFrameHeight", { height: frameHeight });
+      }
+
+      window.addEventListener("message", function (event) {
+        const data = event && event.data;
+        if (!data || data.type !== "streamlit:render") return;
+        renderComponent(data.args || {});
+      });
+
+      // Register as a Streamlit Components v1 frontend and receive initial args.
+      sendMessage("streamlit:componentReady", { apiVersion: 1 });
+      sendMessage("streamlit:setFrameHeight", { height: 720 });
+    })();
+  </script>
+</head>
+<body></body>
+</html>

@@ -1,9 +1,14 @@
 import base64
+import hashlib
 import hmac
 import html
 import io
 import math
+import secrets as py_secrets
+import threading
+import time
 
+import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -41,7 +46,7 @@ st.set_page_config(
 
 
 # ============================================================
-# LOGIN / ACCESS GATE
+# LOGIN / PERSISTENT SESSION ACCESS GATE
 # ============================================================
 
 try:
@@ -60,42 +65,275 @@ except (FileNotFoundError, KeyError):
     st.stop()
 
 
-if "npi_authenticated" not in st.session_state:
+# Streamlit Session State is tied to its WebSocket connection. A reconnect or
+# browser reload can create a new session and clear that state. Use a signed,
+# random browser cookie for login continuity, and a server-side per-cookie cache
+# for the uploaded BAQ and that browser's filters while the app process is alive.
+SESSION_COOKIE_NAME = "npi_control_tower_session"
+SESSION_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days, or until explicit logout
+PERSISTED_STATE_KEYS = {
+    "raw_df",
+    "calc_df",
+    "unique_df",
+    "picture_map",
+    "sheet_name",
+    "selected_classification",
+    "selected_customer",
+    "actions_df",
+    "drilldown_jump_id",
+    "selected_delay_bucket",
+    "selected_hotspot",
+    "selected_commitment_status",
+    "control_tower_customer",
+    "module_selector",
+    "sheet_selector",
+    "drilldown_current_process_filter",
+    "selected_enquiry_parts",
+    "enquiry_search_active",
+    "enquiry_search_message",
+    "enquiry_missing_parts",
+    "show_enquiry_missing_dialog",
+    "enquiry_last_query",
+    "enquiry_input_text",
+    "enquiry_last_input_count",
+    "enquiry_last_matched_count",
+}
+
+
+@st.cache_resource
+def _get_persistent_session_store():
+    """Shared in-memory cache, keyed by an unguessable per-browser token."""
+    return {
+        "sessions": {},
+        "revoked": {},
+        "lock": threading.RLock(),
+    }
+
+
+_persistent_store = _get_persistent_session_store()
+
+
+def _make_session_cookie():
+    issued_at = str(int(time.time()))
+    nonce = py_secrets.token_urlsafe(32)
+    payload = f"npi-control-tower-v1|{LOGIN_USERNAME}|{issued_at}|{nonce}"
+    signature = hmac.new(
+        LOGIN_PASSWORD.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{issued_at}.{nonce}.{signature}"
+
+
+def _verify_session_cookie(token):
+    if not isinstance(token, str) or not token:
+        return False
+
+    try:
+        issued_at_text, nonce, supplied_signature = token.split(".", 2)
+        issued_at = int(issued_at_text)
+    except (TypeError, ValueError):
+        return False
+
+    now = time.time()
+    age = now - issued_at
+    if age < -60 or age > SESSION_TTL_SECONDS:
+        return False
+
+    payload = f"npi-control-tower-v1|{LOGIN_USERNAME}|{issued_at_text}|{nonce}"
+    expected_signature = hmac.new(
+        LOGIN_PASSWORD.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        return False
+
+    with _persistent_store["lock"]:
+        for old_token, expires_at in list(_persistent_store["revoked"].items()):
+            if expires_at <= now:
+                _persistent_store["revoked"].pop(old_token, None)
+        if _persistent_store["revoked"].get(token, 0) > now:
+            return False
+
+    return True
+
+
+def _get_or_create_session_record(token):
+    issued_at = int(token.split(".", 1)[0])
+    expires_at = issued_at + SESSION_TTL_SECONDS
+    now = time.time()
+
+    with _persistent_store["lock"]:
+        for old_token, record in list(_persistent_store["sessions"].items()):
+            if record.get("expires_at", 0) <= now:
+                _persistent_store["sessions"].pop(old_token, None)
+
+        record = _persistent_store["sessions"].get(token)
+        created = record is None
+        if created:
+            record = {
+                "expires_at": expires_at,
+                "state": {},
+            }
+            _persistent_store["sessions"][token] = record
+
+        return record, created
+
+
+def _capture_persistent_state():
+    state = {}
+    for key in PERSISTED_STATE_KEYS:
+        if key in st.session_state:
+            # These values are maintained per browser token. App code generally
+            # replaces DataFrames rather than mutating them in place.
+            state[key] = st.session_state[key]
+
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("drilldown_page_state_"):
+            state[key] = st.session_state[key]
+
+    return state
+
+
+def _save_persistent_state():
+    token = st.session_state.get("_npi_session_token")
+    if not token or not st.session_state.get("npi_authenticated", False):
+        return
+
+    with _persistent_store["lock"]:
+        record = _persistent_store["sessions"].get(token)
+        if record is not None:
+            record["state"] = _capture_persistent_state()
+
+
+def _restore_persistent_state(record):
+    state = record.get("state", {})
+    for key, value in state.items():
+        if key in PERSISTED_STATE_KEYS or str(key).startswith("drilldown_page_state_"):
+            st.session_state[key] = value
+
+
+# The component reads/writes a browser cookie. The cookie contains only a signed
+# session token, never the username or password itself.
+cookie_manager = stx.CookieManager(key="npi_control_tower_cookie_manager")
+try:
+    browser_cookies = cookie_manager.get_all()
+except Exception:
+    browser_cookies = {}
+if not isinstance(browser_cookies, dict):
+    browser_cookies = {}
+
+session_token = (
+    st.session_state.get("_npi_session_token")
+    or browser_cookies.get(SESSION_COOKIE_NAME)
+)
+
+if _verify_session_cookie(session_token):
+    session_record, session_record_created = _get_or_create_session_record(session_token)
+    st.session_state["_npi_session_token"] = session_token
+    st.session_state["npi_authenticated"] = True
+
+    if not st.session_state.get("_npi_persistent_state_loaded", False):
+        _restore_persistent_state(session_record)
+        st.session_state["_npi_persistent_state_loaded"] = True
+        if session_record_created:
+            # The signed login cookie survived, but the app worker's in-memory
+            # BAQ cache did not (for example, after a server process restart).
+            st.session_state["_npi_state_recovery_notice"] = True
+else:
     st.session_state["npi_authenticated"] = False
+    st.session_state.pop("_npi_session_token", None)
+    st.session_state.pop("_npi_persistent_state_loaded", None)
 
 
-if not st.session_state["npi_authenticated"]:
+def _logout_current_session():
+    token = st.session_state.get("_npi_session_token")
+    if token:
+        try:
+            issued_at = int(token.split(".", 1)[0])
+            token_expiry = issued_at + SESSION_TTL_SECONDS
+        except (TypeError, ValueError):
+            token_expiry = time.time() + SESSION_TTL_SECONDS
 
+        with _persistent_store["lock"]:
+            _persistent_store["sessions"].pop(token, None)
+            _persistent_store["revoked"][token] = token_expiry
+
+    try:
+        cookie_manager.delete(SESSION_COOKIE_NAME, key="delete_npi_control_tower_session")
+    except Exception:
+        pass
+
+    # Remove this browser's in-memory BAQ and UI state on explicit logout.
+    for key in list(st.session_state.keys()):
+        if (
+            key in PERSISTED_STATE_KEYS
+            or str(key).startswith("drilldown_page_state_")
+            or key in {"baq_upload", "_npi_session_token", "_npi_persistent_state_loaded", "_npi_state_recovery_notice"}
+        ):
+            try:
+                del st.session_state[key]
+            except Exception:
+                pass
+
+    st.session_state["npi_authenticated"] = False
+    st.rerun()
+
+
+if not st.session_state.get("npi_authenticated", False):
     st.title("NPI Control Tower")
     st.caption("Please sign in to continue.")
 
     with st.form("npi_login_form"):
-
         username = st.text_input("Username")
-
-        password = st.text_input(
-            "Password",
-            type="password",
-        )
-
+        password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Log in")
 
     if submitted:
-
         username_valid = hmac.compare_digest(
-            username.encode("utf-8"),
-            LOGIN_USERNAME.encode("utf-8"),
+            username.encode("utf-8"), LOGIN_USERNAME.encode("utf-8")
         )
-
         password_valid = hmac.compare_digest(
-            password.encode("utf-8"),
-            LOGIN_PASSWORD.encode("utf-8"),
+            password.encode("utf-8"), LOGIN_PASSWORD.encode("utf-8")
         )
 
         if username_valid and password_valid:
-            st.session_state["npi_authenticated"] = True
-            st.rerun()
+            new_token = _make_session_cookie()
+            expiry = int(new_token.split(".", 1)[0]) + SESSION_TTL_SECONDS
+            with _persistent_store["lock"]:
+                _persistent_store["sessions"][new_token] = {
+                    "expires_at": expiry,
+                    "state": {},
+                }
 
+            try:
+                # Secure cookies on hosted HTTPS; allow plain HTTP localhost for testing.
+                try:
+                    request_host = str(st.context.headers.get("Host", "")).lower()
+                except Exception:
+                    request_host = ""
+                secure_cookie = not (
+                    request_host.startswith("localhost")
+                    or request_host.startswith("127.0.0.1")
+                )
+                cookie_manager.set(
+                    cookie=SESSION_COOKIE_NAME,
+                    val=new_token,
+                    key="set_npi_control_tower_session",
+                    max_age=SESSION_TTL_SECONDS,
+                    path="/",
+                    secure=secure_cookie,
+                    same_site="lax",
+                )
+            except Exception:
+                st.error("Unable to create a persistent login cookie. Please refresh and try again.")
+                st.stop()
+
+            st.session_state["_npi_session_token"] = new_token
+            st.session_state["npi_authenticated"] = True
+            st.session_state["_npi_persistent_state_loaded"] = False
+            st.rerun()
         else:
             st.error("Invalid username or password.")
 
@@ -103,10 +341,8 @@ if not st.session_state["npi_authenticated"]:
 
 
 with st.sidebar:
-
-    if st.button("Log out"):
-        st.session_state["npi_authenticated"] = False
-        st.rerun()
+    if st.button("Log out", key="npi_logout_button", use_container_width=True):
+        _logout_current_session()
 
 
 # ============================================================
@@ -129,6 +365,17 @@ DEFAULT_STATE = {
     "drilldown_jump_id": 0,
     "selected_delay_bucket": "",
     "selected_hotspot": "",
+    "selected_commitment_status": "",
+    "drilldown_current_process_filter": "ALL",
+    "selected_enquiry_parts": [],
+    "enquiry_search_active": False,
+    "enquiry_search_message": "",
+    "enquiry_missing_parts": [],
+    "show_enquiry_missing_dialog": False,
+    "enquiry_last_query": "",
+    "enquiry_input_text": "",
+    "enquiry_last_input_count": 0,
+    "enquiry_last_matched_count": 0,
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -226,6 +473,187 @@ def first_existing_column(
     return None
 
 
+def normalize_part_number(value):
+    """Normalize part numbers for whitespace-insensitive, case-insensitive exact matching."""
+    return safe_text(value).strip().casefold()
+
+
+def build_delay_commitment_status_map(unique_df, actions_df, control_date):
+    """Map each delayed unique part in the current customer scope to its commitment status.
+
+    The unique-part dataset remains the source of truth. A delayed part without an
+    action record or commitment date is classified as NO COMMITMENT. Completed
+    actions are excluded from the four open-commitment tiles.
+    """
+    status_map = {}
+    if not isinstance(unique_df, pd.DataFrame) or unique_df.empty:
+        return status_map
+
+    part_col = first_existing_column(
+        unique_df,
+        ["PART NUMBER", "Part Number", "Subpart Part Num", "PART", "Part"],
+    )
+    if not part_col:
+        return status_map
+
+    work_df = unique_df.copy()
+    class_col = first_existing_column(
+        work_df,
+        ["CALC_CLASSIFICATION", "CLASSIFICATION"],
+    )
+    if class_col:
+        work_df = work_df[
+            work_df[class_col].fillna("").astype(str).str.strip().str.upper().isin(
+                {"RED - ENGINEERING", "RED - PROCESS", "RED - PRODUCTION"}
+            )
+        ].copy()
+
+    action_status_by_part = {}
+    if isinstance(actions_df, pd.DataFrame) and not actions_df.empty:
+        action_part_col = first_existing_column(
+            actions_df,
+            ["PART_NUMBER", "Part Number", "PART NUMBER", "Subpart Part Num"],
+        )
+        commitment_date_col = first_existing_column(
+            actions_df,
+            ["COMMITMENT_DATE", "Commitment Date"],
+        )
+        action_status_col = first_existing_column(
+            actions_df,
+            ["ACTION_STATUS", "Action Status", "STATUS", "Commitment Status"],
+        )
+        if action_part_col:
+            for _, action_row in actions_df.iterrows():
+                part_key = normalize_part_number(action_row.get(action_part_col, ""))
+                if not part_key:
+                    continue
+                status = calculate_commitment_status(
+                    action_row.get(commitment_date_col, "") if commitment_date_col else "",
+                    action_row.get(action_status_col, "") if action_status_col else "",
+                    control_date,
+                )
+                # Keep the last stored record for a part, matching the existing drilldown/export lookup.
+                action_status_by_part[part_key] = status
+
+    allowed_statuses = {"OVERDUE", "DUE TODAY", "UPCOMING", "NO COMMITMENT"}
+    for part_value in work_df[part_col].tolist():
+        part_key = normalize_part_number(part_value)
+        if not part_key:
+            continue
+        status = action_status_by_part.get(part_key, "NO COMMITMENT")
+        if status in allowed_statuses:
+            status_map[part_key] = status
+
+    return status_map
+
+
+def _run_enquiry_search():
+    """Search the uploaded unique-part dataset from a native Streamlit form."""
+    raw_payload = safe_text(
+        st.session_state.get("enquiry_input_text", "")
+    )
+    requested = []
+    seen = set()
+
+    for line in raw_payload.splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        normalized = normalize_part_number(item)
+        if normalized and normalized not in seen:
+            requested.append(item)
+            seen.add(normalized)
+
+    st.session_state["enquiry_last_query"] = "\n".join(requested)
+    st.session_state["enquiry_last_input_count"] = len(requested)
+    st.session_state["enquiry_missing_parts"] = []
+    st.session_state["show_enquiry_missing_dialog"] = False
+
+    if not requested:
+        st.session_state["selected_enquiry_parts"] = []
+        st.session_state["enquiry_search_active"] = False
+        st.session_state["enquiry_last_matched_count"] = 0
+        st.session_state["enquiry_search_message"] = (
+            "Enter one full part number per line, then click SEARCH."
+        )
+        return
+
+    source_df = st.session_state.get("unique_df")
+    part_col = first_existing_column(
+        source_df,
+        ["PART NUMBER", "Part Number", "Subpart Part Num", "PART", "Part"],
+    ) if isinstance(source_df, pd.DataFrame) else None
+
+    if source_df is None or source_df.empty or part_col is None:
+        matched_keys = []
+        missing_parts = requested[:]
+    else:
+        available = {}
+        for value in source_df[part_col].tolist():
+            normalized = normalize_part_number(value)
+            if normalized and normalized not in available:
+                available[normalized] = safe_text(value).strip()
+
+        matched_keys = []
+        missing_parts = []
+        for item in requested:
+            normalized = normalize_part_number(item)
+            if normalized in available:
+                if normalized not in matched_keys:
+                    matched_keys.append(normalized)
+            else:
+                missing_parts.append(item)
+
+    st.session_state["selected_enquiry_parts"] = matched_keys
+    st.session_state["enquiry_search_active"] = True
+    st.session_state["enquiry_missing_parts"] = missing_parts
+    st.session_state["enquiry_last_matched_count"] = len(matched_keys)
+    st.session_state["enquiry_search_message"] = (
+        f"Matched {len(matched_keys):,} of {len(requested):,} part number(s). "
+        f"Not found: {len(missing_parts):,}."
+    )
+    st.session_state["show_enquiry_missing_dialog"] = bool(missing_parts)
+
+    # Enquiry searches span the full uploaded BAQ, not only the previously
+    # selected customer/classification/bucket/hotspot.
+    st.session_state["selected_customer"] = "ALL"
+    if "control_tower_customer" in st.session_state:
+        st.session_state["control_tower_customer"] = "ALL"
+    st.session_state["selected_classification"] = "ALL"
+    st.session_state["selected_delay_bucket"] = ""
+    st.session_state["selected_hotspot"] = ""
+    st.session_state["selected_commitment_status"] = ""
+    st.session_state["drilldown_current_process_filter"] = "ALL"
+    for page_key in list(st.session_state.keys()):
+        if str(page_key).startswith("drilldown_page_state_"):
+            st.session_state[page_key] = 1
+
+
+def _dismiss_enquiry_missing_dialog():
+    st.session_state["show_enquiry_missing_dialog"] = False
+
+
+@st.dialog("Part number(s) not found", width="small")
+def _render_enquiry_missing_dialog():
+    missing_parts = st.session_state.get("enquiry_missing_parts", [])
+    st.warning(
+        f"{len(missing_parts):,} part number(s) did not match the uploaded BAQ."
+    )
+    st.caption("These part numbers were not found:")
+    st.code("\n".join(str(part) for part in missing_parts), language=None)
+
+    # A dialog runs as a Streamlit fragment. Updating only the flag in a
+    # button callback can leave the dialog open; explicitly rerun the full app
+    # so the top-level conditional stops rendering this dialog.
+    if st.button(
+        "Close",
+        key="enquiry_missing_dialog_close",
+        use_container_width=True,
+    ):
+        st.session_state["show_enquiry_missing_dialog"] = False
+        st.rerun(scope="app")
+
+
 # ============================================================
 # DATA BUILD
 # ============================================================
@@ -283,6 +711,18 @@ def load_and_build(
     st.session_state.unique_df = unique_df
     st.session_state.picture_map = picture_map
     st.session_state.sheet_name = sheet_name
+    st.session_state["_npi_state_recovery_notice"] = False
+
+    # A freshly loaded BAQ invalidates any old Enquiry Finder selection.
+    st.session_state["selected_enquiry_parts"] = []
+    st.session_state["enquiry_search_active"] = False
+    st.session_state["enquiry_search_message"] = ""
+    st.session_state["enquiry_missing_parts"] = []
+    st.session_state["show_enquiry_missing_dialog"] = False
+    st.session_state["enquiry_last_query"] = ""
+    st.session_state["enquiry_input_text"] = ""
+    st.session_state["enquiry_last_input_count"] = 0
+    st.session_state["enquiry_last_matched_count"] = 0
 
     return (
         raw_df,
@@ -513,6 +953,9 @@ with st.sidebar:
 
     st.markdown("### MODULE")
 
+    if st.session_state.get("module_selector") == "Management Commitment":
+        st.session_state["module_selector"] = "Control Tower"
+
     module = st.radio(
         "Select module",
         [
@@ -520,7 +963,6 @@ with st.sidebar:
             "Data Validation",
             "Unique-Part Validation",
             "Calculation Layer",
-            "Management Commitment",
         ],
         key="module_selector",
         label_visibility="collapsed",
@@ -551,6 +993,12 @@ if (
 ):
 
     st.title("NPI CONTROL TOWER")
+
+    if st.session_state.get("_npi_state_recovery_notice", False):
+        st.info(
+            "Your login session was restored. The previous BAQ data was not "
+            "available after the app server restarted, so please upload the BAQ again."
+        )
 
     st.info(
         "Upload the Virgin Epicor Web BAQ "
@@ -952,7 +1400,7 @@ def render_ui_controller(
                                 "28px";
 
                             button.style.bottom =
-                                "28px";
+                                "58px";
 
                             button.style.zIndex =
                                 "2147483647";
@@ -1343,8 +1791,8 @@ def build_donut_svg(
     width = 300
     height = 270
 
-    cx = 135
-    cy = 135
+    cx = width / 2
+    cy = height / 2
 
     outer_radius = 96
     inner_radius = 58
@@ -1785,6 +2233,9 @@ def render_executive_status(
         ] = classification
         st.session_state["selected_delay_bucket"] = ""
         st.session_state["selected_hotspot"] = ""
+        st.session_state["selected_commitment_status"] = ""
+        st.session_state["drilldown_current_process_filter"] = "ALL"
+        st.session_state["enquiry_search_active"] = False
 
         # A fresh selection requests one scroll to the drilldown.
         st.session_state[
@@ -1864,7 +2315,10 @@ def render_executive_status(
             def select_delay_bucket(bucket):
                 st.session_state["selected_delay_bucket"] = bucket
                 st.session_state["selected_hotspot"] = ""
+                st.session_state["selected_commitment_status"] = ""
                 st.session_state["selected_classification"] = "ALL"
+                st.session_state["drilldown_current_process_filter"] = "ALL"
+                st.session_state["enquiry_search_active"] = False
                 st.session_state["drilldown_jump_id"] = int(
                     st.session_state.get("drilldown_jump_id", 0)
                 ) + 1
@@ -1883,7 +2337,10 @@ def render_executive_status(
         def select_production_hotspot(operation):
             st.session_state["selected_hotspot"] = operation
             st.session_state["selected_delay_bucket"] = ""
+            st.session_state["selected_commitment_status"] = ""
             st.session_state["selected_classification"] = "ALL"
+            st.session_state["drilldown_current_process_filter"] = "ALL"
+            st.session_state["enquiry_search_active"] = False
             st.session_state["drilldown_jump_id"] = int(
                 st.session_state.get("drilldown_jump_id", 0)
             ) + 1
@@ -1903,6 +2360,34 @@ def render_executive_status(
                         on_click=select_production_hotspot,
                         args=(operation,),
                     )
+
+        # Hidden real Streamlit bridge buttons for Delay Commitment tile clicks.
+        # These preserve the existing proven iframe-to-Streamlit click mechanism.
+        def select_delay_commitment_status(status):
+            st.session_state["selected_commitment_status"] = status
+            st.session_state["selected_classification"] = "ALL"
+            st.session_state["selected_delay_bucket"] = ""
+            st.session_state["selected_hotspot"] = ""
+            st.session_state["drilldown_current_process_filter"] = "ALL"
+            st.session_state["enquiry_search_active"] = False
+            st.session_state["selected_enquiry_parts"] = []
+            st.session_state["drilldown_jump_id"] = int(
+                st.session_state.get("drilldown_jump_id", 0)
+            ) + 1
+            for page_key in list(st.session_state.keys()):
+                if str(page_key).startswith("drilldown_page_state_"):
+                    st.session_state[page_key] = 1
+            if "npi_exec" in st.query_params:
+                del st.query_params["npi_exec"]
+
+        for commitment_status in ["OVERDUE", "DUE TODAY", "UPCOMING", "NO COMMITMENT"]:
+            bridge_text = "DELAY COMMITMENT BRIDGE " + commitment_status
+            st.button(
+                bridge_text,
+                key="floating_delay_commitment_bridge_" + commitment_status.lower().replace(" ", "_"),
+                on_click=select_delay_commitment_status,
+                args=(commitment_status,),
+            )
 
         st.markdown(
             """
@@ -2042,6 +2527,47 @@ def render_executive_status(
                 hotspot_rows_html += ('<button type="button" class="npi-hotspot-row" data-hotspot="' + html.escape(operation, quote=True) + '"><span class="npi-hotspot-operation">' + html.escape(operation) + '</span><span class="npi-hotspot-count">' + html.escape(count_text) + '</span></button>')
 
     # ============================================================
+    # 6D. DELAY COMMITMENT TILES
+    # ============================================================
+
+    commitment_status_map = build_delay_commitment_status_map(
+        df,
+        st.session_state.get("actions_df"),
+        pd.Timestamp.today().normalize(),
+    )
+    commitment_status_order = [
+        "OVERDUE",
+        "DUE TODAY",
+        "UPCOMING",
+        "NO COMMITMENT",
+    ]
+    commitment_status_styles = {
+        "OVERDUE": ("#FDECEC", "#E7A2A2", "#BA3F48", "!"),
+        "DUE TODAY": ("#FFF3DD", "#EAC77F", "#98630F", "•"),
+        "UPCOMING": ("#EAF3FF", "#B9D2F0", "#3268A2", "↗"),
+        "NO COMMITMENT": ("#F0EEFB", "#D0C8F2", "#6552A0", "?"),
+    }
+    selected_commitment_status = st.session_state.get("selected_commitment_status", "")
+    commitment_tiles_html = ""
+    for commitment_status in commitment_status_order:
+        count = sum(1 for item_status in commitment_status_map.values() if item_status == commitment_status)
+        tile_bg, tile_border, tile_accent, icon_text = commitment_status_styles[commitment_status]
+        selected_class = " is-selected" if selected_commitment_status == commitment_status else ""
+        bridge_text = "DELAY COMMITMENT BRIDGE " + commitment_status
+        commitment_tiles_html += f"""
+            <button type="button"
+                    class="npi-delay-commitment-tile{selected_class}"
+                    data-status="{html.escape(commitment_status, quote=True)}"
+                    data-bridge-label="{html.escape(bridge_text, quote=True)}"
+                    style="--commitment-bg:{tile_bg};--commitment-border:{tile_border};--commitment-accent:{tile_accent};">
+                <span class="npi-commitment-icon">{icon_text}</span>
+                <span class="npi-commitment-label">{html.escape(commitment_status)}</span>
+                <span class="npi-commitment-count">{count:,}</span>
+                <span class="npi-commitment-unit">PARTS</span>
+            </button>
+        """
+
+    # ============================================================
     # 7. FLOATING HTML
     # ============================================================
 
@@ -2070,7 +2596,7 @@ body {{
     position: relative;
 
     width: 100%;
-    height: 455px;
+    height: 553px;
 
     margin: 0;
     padding: 0;
@@ -2081,6 +2607,36 @@ body {{
         Arial,
         Helvetica,
         sans-serif;
+}}
+
+/* Draggable boundary that controls the dashboard iframe height / space before Drilldown. */
+.npi-dashboard-drilldown-boundary {{
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: ns-resize;
+    touch-action: none;
+    user-select: none;
+    z-index: 2147483647;
+    background: linear-gradient(to bottom, rgba(245,247,250,0), rgba(232,237,244,0.62));
+}}
+.npi-dashboard-drilldown-boundary-grip {{
+    width: 76px;
+    height: 5px;
+    border-radius: 999px;
+    background: #AAB5C3;
+    box-shadow: 0 1px 3px rgba(23,40,63,0.18);
+    transition: background 120ms ease, width 120ms ease, box-shadow 120ms ease;
+}}
+.npi-dashboard-drilldown-boundary:hover .npi-dashboard-drilldown-boundary-grip {{
+    width: 104px;
+    background: #315C83;
+    box-shadow: 0 0 0 3px rgba(49,92,131,0.10);
 }}
 
 /* ============================================================
@@ -2479,28 +3035,440 @@ body {{
 .npi-hotspot-count {{ text-align: right; }}
 
 /* ============================================================
-   ENQUIRY FINDER
+   PART DELAY DAYS BUCKET — MODERN VISUAL TREATMENT
+   Presentation-only CSS. IDs, classes, DOM structure and click
+   handlers remain unchanged.
    ============================================================ */
+#npi-delay-bucket-panel {{
+    border: 1px solid #D8E2EF !important;
+    border-radius: 12px !important;
+    background: #FFFFFF !important;
+    box-shadow: 0 8px 22px rgba(27, 49, 79, 0.10) !important;
+}}
+#npi-delay-bucket-panel .npi-floating-header {{
+    height: 38px;
+    min-height: 38px;
+    padding: 0 12px;
+    gap: 9px;
+    background: linear-gradient(90deg, #FFF5E8 0%, #FFFBF5 100%);
+    border-bottom: 1px solid #F2E2CD;
+    color: #724719;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.85px;
+}}
+#npi-delay-bucket-panel .npi-floating-header::before {{
+    content: "";
+    display: block;
+    flex: 0 0 4px;
+    width: 4px;
+    height: 20px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #E49B39 0%, #F2C078 100%);
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-content {{
+    padding: 9px;
+    gap: 8px;
+    background: linear-gradient(145deg, #FFFFFF 0%, #FFFCF7 100%);
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-tile {{
+    border: 1px solid var(--bucket-border, #D7DADF);
+    border-radius: 8px;
+    box-shadow: 0 2px 5px rgba(42, 55, 71, 0.055);
+    color: #28384B;
+    font-family: Arial, Helvetica, sans-serif;
+    transition: transform 130ms ease, box-shadow 130ms ease, filter 130ms ease;
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-tile:hover {{
+    filter: brightness(0.99);
+    transform: translateY(-1px);
+    box-shadow: 0 5px 12px rgba(42, 55, 71, 0.11);
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-tile:focus-visible {{
+    outline: 2px solid #376A9E;
+    outline-offset: 1px;
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-tile.is-selected {{
+    border: 2px solid #315F91;
+    box-shadow: 0 0 0 2px rgba(49, 95, 145, 0.15), 0 4px 10px rgba(42, 55, 71, 0.08);
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-label {{
+    color: #5B6573;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.35px;
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-count {{
+    color: #1E334D;
+    font-size: 22px;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.05;
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-percent {{
+    color: #69778A;
+    font-size: 9px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-content::-webkit-scrollbar {{
+    width: 7px;
+}}
+#npi-delay-bucket-panel .npi-delay-bucket-content::-webkit-scrollbar-thumb {{
+    background: #D8DEE8;
+    border-radius: 999px;
+}}
 
-.npi-enquiry-floating-content {{
-    width: 100%;
+/* ============================================================
+   PRODUCTION HOTSPOT — MODERN VISUAL TREATMENT
+   Presentation-only CSS. Row-click behavior remains unchanged.
+   ============================================================ */
+#npi-hotspot-panel {{
+    border: 1px solid #D8E2EF !important;
+    border-radius: 12px !important;
+    background: #FFFFFF !important;
+    box-shadow: 0 8px 22px rgba(27, 49, 79, 0.10) !important;
+}}
+#npi-hotspot-panel .npi-floating-header {{
+    height: 38px;
+    min-height: 38px;
+    padding: 0 12px !important;
+    gap: 9px;
+    background: linear-gradient(90deg, #F1F6FE 0%, #FBFCFE 100%);
+    border-bottom: 1px solid #DCE6F2;
+    color: #244466;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.85px;
+}}
+#npi-hotspot-panel .npi-floating-header::before {{
+    content: "";
+    display: block;
+    flex: 0 0 4px;
+    width: 4px;
+    height: 20px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #4B83C4 0%, #86AFE0 100%);
+}}
+#npi-hotspot-panel .npi-hotspot-content {{
+    padding: 9px;
+    background: linear-gradient(145deg, #FFFFFF 0%, #F8FBFF 100%);
+}}
+#npi-hotspot-panel .npi-hotspot-row {{
+    min-height: 36px;
+    margin-bottom: 6px;
+    padding: 7px 9px;
+    border: 1px solid #E0E8F2;
+    border-radius: 7px;
+    background: #FFFFFF;
+    color: #263A54;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}}
+#npi-hotspot-panel .npi-hotspot-row:hover {{
+    background: #F7FAFE;
+    border-color: #B9CDE4;
+    box-shadow: 0 3px 8px rgba(31, 67, 111, 0.08);
+    transform: translateY(-1px);
+}}
+#npi-hotspot-panel .npi-hotspot-row:focus-visible {{
+    outline: 2px solid #376A9E;
+    outline-offset: 1px;
+}}
+#npi-hotspot-panel .npi-hotspot-operation {{
+    color: #2B405A;
+    font-weight: 700;
+}}
+#npi-hotspot-panel .npi-hotspot-count {{
+    justify-self: end;
+    min-width: 36px;
+    padding: 3px 7px;
+    border: 1px solid #DDE8F5;
+    border-radius: 999px;
+    background: #EDF4FC;
+    color: #315C8B;
+    font-size: 10px;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+}}
+#npi-hotspot-panel .npi-hotspot-content::-webkit-scrollbar {{
+    width: 7px;
+}}
+#npi-hotspot-panel .npi-hotspot-content::-webkit-scrollbar-thumb {{
+    background: #D8DEE8;
+    border-radius: 999px;
+}}
 
-    height:
-        calc(100% - 38px);
-
+/* ============================================================
+   EXECUTIVE STATUS — MODERN VISUAL TREATMENT
+   Scoped to Executive Status; no changes to other widget styles.
+   ============================================================ */
+#npi-executive-panel {{
+    border: 1px solid #D8E2EF !important;
+    border-radius: 12px !important;
+    background: #FFFFFF !important;
+    box-shadow: 0 8px 22px rgba(27, 49, 79, 0.10) !important;
+}}
+#npi-executive-panel .npi-floating-header {{
+    height: 38px;
+    min-height: 38px;
+    padding: 0 12px;
+    gap: 9px;
+    background: linear-gradient(90deg, #EEF4FC 0%, #F8FAFD 100%);
+    border-bottom: 1px solid #DCE6F2;
+    color: #183153;
+}}
+#npi-executive-panel .npi-floating-header::before {{
+    content: "";
+    display: block;
+    flex: 0 0 4px;
+    width: 4px;
+    height: 20px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #2F80ED 0%, #5B9CF0 100%);
+}}
+.npi-executive-heading {{
     display: flex;
-
-    align-items: center;
-
-    justify-content: center;
-
-    padding: 12px;
-
-    color: #777777;
-
+    align-items: baseline;
+    gap: 9px;
+    min-width: 0;
+    flex: 1 1 auto;
+    white-space: nowrap;
+}}
+.npi-executive-title {{
+    color: #183153;
+    font-family: Arial, Helvetica, sans-serif;
     font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.9px;
+    line-height: 1.15;
+}}
+.npi-executive-subtitle {{
+    color: #708198;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 9px;
+    font-weight: 500;
+    letter-spacing: 0.05px;
+    line-height: 1.2;
+}}
+#npi-executive-panel .npi-floating-header-actions {{
+    flex: 0 0 auto;
+    gap: 6px;
+}}
+#npi-executive-panel .npi-floating-reset {{
+    height: 24px;
+    padding: 0 9px;
+    border: 1px solid #C7D5E7;
+    border-radius: 6px;
+    background: #FFFFFF;
+    color: #355477;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+}}
+#npi-executive-panel .npi-floating-reset:hover {{
+    background: #F7FAFE;
+    border-color: #8FB2DF;
+}}
+#npi-executive-panel .npi-executive-floating-content {{
+    height: calc(100% - 38px);
+    padding: 8px 10px;
+    background: linear-gradient(145deg, #FFFFFF 0%, #F8FBFF 100%);
+}}
+#npi-executive-panel .npi-executive-floating-inner {{
+    gap: 10px;
+    align-items: center;
+}}
+/* Keep the SVG itself as the only donut visual: no extra circle/shadow behind it. */
+#npi-executive-panel .npi-floating-donut {{
+    flex: 0 0 260px;
+    width: 260px;
+    height: 260px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+}}
+#npi-executive-panel .npi-float-legend {{
+    border: 1px solid #E0E8F2;
+    border-radius: 7px;
+    background: #FFFFFF;
+    color: #263A54;
+    font-family: Arial, Helvetica, sans-serif;
+    box-shadow: 0 1px 2px rgba(25, 48, 78, 0.035);
+    transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}}
+#npi-executive-panel .npi-float-legend:hover {{
+    background: #FFFFFF;
+    border-color: #B7CBE3;
+    box-shadow: 0 3px 8px rgba(31, 67, 111, 0.08);
+    transform: translateY(-1px);
+}}
+#npi-executive-panel .npi-float-count {{
+    color: #182D49;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+}}
+#npi-executive-panel .npi-float-percent {{
+    color: #728299;
+    font-variant-numeric: tabular-nums;
+}}
 
-    text-align: center;
+/* ============================================================
+   DELAY COMMITMENT — HIGH-PRIORITY STATUS TILES
+   Visual-only update. Existing tile IDs/data attributes and
+   click/drag/resize controller remain unchanged.
+   ============================================================ */
+#npi-delay-commitment-panel {{
+    border: 1px solid #D5AEB2 !important;
+    border-radius: 13px !important;
+    background: #FFFFFF !important;
+    box-shadow: 0 10px 26px rgba(82, 28, 37, 0.16), 0 2px 6px rgba(27, 49, 79, 0.06) !important;
+}}
+#npi-delay-commitment-panel .npi-floating-header {{
+    height: 38px;
+    min-height: 38px;
+    padding: 0 12px;
+    gap: 9px;
+    background: linear-gradient(100deg, #17283F 0%, #263F5D 72%, #334D6C 100%);
+    border-bottom: 2px solid #D94F5C;
+    color: #FFFFFF;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 12px;
+    font-weight: 900;
+    letter-spacing: 1px;
+}}
+#npi-delay-commitment-panel .npi-floating-header::before {{
+    content: "";
+    display: block;
+    flex: 0 0 5px;
+    width: 5px;
+    height: 22px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #FF8A8A 0%, #DC3545 100%);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
+}}
+#npi-delay-commitment-panel .npi-commitment-priority-badge {{
+    display: inline-flex;
+    align-items: center;
+    margin-left: auto;
+    padding: 4px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    border-radius: 999px;
+    background: #D94F5C;
+    color: #FFFFFF;
+    font-size: 9px;
+    line-height: 1;
+    font-weight: 900;
+    letter-spacing: 0.8px;
+    white-space: nowrap;
+}}
+#npi-delay-commitment-panel .npi-delay-commitment-content {{
+    width: 100%;
+    height: calc(100% - 38px);
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-rows: minmax(0, 1fr);
+    gap: 7px;
+    padding: 8px;
+    overflow: hidden;
+    background: linear-gradient(145deg, #FFFFFF 0%, #F5F7FB 100%);
+}}
+#npi-delay-commitment-panel .npi-delay-commitment-tile {{
+    position: relative;
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    gap: 3px;
+    padding: 8px 10px 7px 12px;
+    border: 1px solid var(--commitment-border, #D7DADF);
+    border-left: 4px solid var(--commitment-accent, #D94F5C);
+    border-radius: 10px;
+    background: linear-gradient(145deg, var(--commitment-bg, #FFFFFF) 0%, #FFFFFF 100%);
+    color: #25364B;
+    text-align: left;
+    cursor: pointer;
+    font-family: Arial, Helvetica, sans-serif;
+    box-shadow: 0 2px 6px rgba(34, 52, 78, 0.055);
+    transition: transform 130ms ease, box-shadow 130ms ease, filter 130ms ease;
+}}
+#npi-delay-commitment-panel .npi-delay-commitment-tile:hover {{
+    transform: translateY(-2px);
+    filter: saturate(1.04) brightness(0.995);
+    box-shadow: 0 7px 15px rgba(32, 54, 78, 0.14);
+}}
+#npi-delay-commitment-panel .npi-delay-commitment-tile:focus-visible {{
+    outline: 3px solid #274C75;
+    outline-offset: 1px;
+}}
+#npi-delay-commitment-panel .npi-delay-commitment-tile.is-selected {{
+    border: 2px solid var(--commitment-accent, #D94F5C);
+    border-left-width: 5px;
+    box-shadow: 0 0 0 2px rgba(217, 79, 92, 0.13), 0 5px 12px rgba(32, 54, 78, 0.12);
+}}
+#npi-delay-commitment-panel .npi-commitment-icon {{
+    position: absolute;
+    top: 7px;
+    right: 7px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: 1px solid rgba(255, 255, 255, 0.85);
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.82);
+    color: var(--commitment-accent, #D94F5C);
+    font-size: 14px;
+    line-height: 1;
+    font-weight: 900;
+}}
+#npi-delay-commitment-panel .npi-commitment-label {{
+    display: block;
+    width: 100%;
+    padding-right: 27px;
+    color: var(--commitment-accent, #3B4A5D);
+    font-size: 12px;
+    line-height: 1.15;
+    font-weight: 900;
+    letter-spacing: 0.15px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}}
+#npi-delay-commitment-panel .npi-commitment-count {{
+    display: block;
+    color: #17283F;
+    font-size: 29px;
+    line-height: 0.98;
+    font-weight: 900;
+    letter-spacing: -0.65px;
+    font-variant-numeric: tabular-nums;
+}}
+#npi-delay-commitment-panel .npi-commitment-unit {{
+    display: block;
+    color: #69788D;
+    font-size: 9px;
+    line-height: 1.1;
+    font-weight: 800;
+    letter-spacing: 1px;
+}}
+#npi-delay-commitment-panel .npi-delay-commitment-content::-webkit-scrollbar {{
+    width: 7px;
+}}
+#npi-delay-commitment-panel .npi-delay-commitment-content::-webkit-scrollbar-thumb {{
+    background: #D8E0EB;
+    border-radius: 999px;
 }}
 
 </style>
@@ -2510,46 +3478,6 @@ body {{
     class="npi-floating-stage"
     id="npi-floating-stage"
 >
-
-    <!-- ========================================================
-         ENQUIRY FINDER
-         ======================================================== -->
-
-    <div
-        class="npi-floating-panel"
-        id="npi-enquiry-panel"
-        data-layout-id="enquiry"
-        style="
-            left:12px;
-            top:12px;
-            width:270px;
-            height:170px;
-        "
-    >
-
-        <div
-            class="npi-floating-header"
-            data-drag-handle
-        >
-
-            <span>
-                ENQUIRY FINDER
-            </span>
-
-        </div>
-
-
-        <div
-            class="npi-enquiry-floating-content"
-        >
-
-            ENQUIRY FINDER<br>
-            RESERVED SPACE
-
-        </div>
-
-    </div>
-
 
     <!-- ========================================================
          PART DELAY DAYS BUCKET
@@ -2598,9 +3526,10 @@ body {{
             data-drag-handle
         >
 
-            <span>
-                EXECUTIVE STATUS
-            </span>
+            <div class="npi-executive-heading">
+                <span class="npi-executive-title">EXECUTIVE STATUS</span>
+                <span class="npi-executive-subtitle">Portfolio status at a glance</span>
+            </div>
 
 
             <div
@@ -2651,6 +3580,29 @@ body {{
 
     </div>
 
+    <!-- ========================================================
+         DELAY COMMITMENT
+         ======================================================== -->
+    <div class="npi-floating-panel" id="npi-delay-commitment-panel" data-layout-id="delayCommitment"
+         style="left:330px;top:395px;width:760px;height:140px;">
+        <div class="npi-floating-header" data-drag-handle>
+            <span>DELAY COMMITMENT</span>
+            <span class="npi-commitment-priority-badge">HIGH PRIORITY</span>
+        </div>
+        <div class="npi-delay-commitment-content">
+            {commitment_tiles_html}
+        </div>
+    </div>
+
+    <div id="npi-dashboard-drilldown-boundary"
+         class="npi-dashboard-drilldown-boundary"
+         role="separator"
+         aria-orientation="horizontal"
+         aria-label="Drag to adjust the space before Drilldown"
+         title="Drag up/down to adjust the space before Drilldown">
+        <span class="npi-dashboard-drilldown-boundary-grip"></span>
+    </div>
+
 </div>
 
 
@@ -2668,12 +3620,6 @@ body {{
 
     const DEFAULT_LAYOUT = {{
 
-        enquiry: {{
-            left: 12,
-            top: 12,
-            width: 270,
-            height: 170
-        }},
 
         executive: {{
             left: 300,
@@ -2687,6 +3633,13 @@ body {{
             top: 200,
             width: 270,
             height: 245
+        }},
+
+        delayCommitment: {{
+            left: 330,
+            top: 395,
+            width: 620,
+            height: 185
         }},
 
         hotspot: {{
@@ -2992,6 +3945,7 @@ body {{
 
 
         saveLayout();
+        applyDashboardHeight(DEFAULT_DASHBOARD_HEIGHT, true);
 
     }}
 
@@ -3388,7 +4342,11 @@ body {{
                 "3–6 MONTHS",
                 "6–12 MONTHS",
                 "1–2 YEARS",
-                ">2 YEARS"
+                ">2 YEARS",
+                "DELAY COMMITMENT BRIDGE OVERDUE",
+                "DELAY COMMITMENT BRIDGE DUE TODAY",
+                "DELAY COMMITMENT BRIDGE UPCOMING",
+                "DELAY COMMITMENT BRIDGE NO COMMITMENT"
             ];
 
 
@@ -3687,6 +4645,206 @@ body {{
     }}
 
     /* ========================================================
+       DELAY COMMITMENT TILE CLICK
+       ======================================================== */
+    function wireDelayCommitmentTiles() {{
+        document.querySelectorAll(".npi-delay-commitment-tile").forEach(function(tile) {{
+            if (tile.dataset.npiCommitmentWired === "1") return;
+            tile.dataset.npiCommitmentWired = "1";
+            tile.addEventListener("click", function(event) {{
+                event.preventDefault();
+                event.stopPropagation();
+                const bridgeLabel = tile.getAttribute("data-bridge-label");
+                if (!bridgeLabel) return;
+                clickStreamlitLegend("DELAY_COMMITMENT", bridgeLabel);
+            }});
+        }});
+    }}
+
+    /* ========================================================
+       RESIZABLE DASHBOARD / DRILLDOWN BOUNDARY
+       ======================================================== */
+
+    const DASHBOARD_HEIGHT_KEY = "npi_control_tower_dashboard_stage_height_v2";
+    const DEFAULT_DASHBOARD_HEIGHT = 553;
+    const MAX_DASHBOARD_HEIGHT = 900;
+
+    function getDashboardMinimumHeight() {{
+        // Keep the initial dashboard height at 553px, but let the user
+        // drag the bottom boundary upward to 300px when they want a tighter
+        // transition into Drilldown. The boundary is a user-controlled layout
+        // height, so it must not be clamped to the lowest floating panel.
+        return 300;
+    }}
+
+    function readDashboardHeight() {{
+        let raw = null;
+        try {{ raw = localStorage.getItem(DASHBOARD_HEIGHT_KEY); }} catch (error) {{}}
+        if (!raw) {{
+            try {{ raw = window.parent.localStorage.getItem(DASHBOARD_HEIGHT_KEY); }} catch (error) {{}}
+        }}
+        const value = Number(raw);
+        return Number.isFinite(value) && value > 0 ? value : DEFAULT_DASHBOARD_HEIGHT;
+    }}
+
+    function syncDrilldownGap() {{
+        // Keep the native Drilldown anchor exactly 20px below the dashboard iframe.
+        // Streamlit renders several wrapper elements around components, so measuring
+        // the real DOM positions is more reliable than guessing their default margins.
+        try {{
+            const frame = window.frameElement;
+            const anchor = window.parent.document.getElementById("npi-drilldown-anchor");
+            if (!frame || !anchor) return;
+
+            let drilldownBlock = anchor;
+            while (drilldownBlock && drilldownBlock !== window.parent.document.body) {{
+                if (drilldownBlock.getAttribute && drilldownBlock.getAttribute("data-testid") === "stElementContainer") break;
+                drilldownBlock = drilldownBlock.parentElement;
+            }}
+            if (!drilldownBlock || drilldownBlock === window.parent.document.body) return;
+
+            const targetGap = 20;
+            const frameBottom = frame.getBoundingClientRect().bottom;
+            const anchorTop = anchor.getBoundingClientRect().top;
+            const correction = frameBottom + targetGap - anchorTop;
+            const currentMargin = parseFloat(drilldownBlock.style.marginTop || "0") || 0;
+            if (Math.abs(correction) > 0.5) {{
+                drilldownBlock.style.setProperty("margin-top", (currentMargin + correction) + "px", "important");
+            }}
+        }} catch (error) {{}}
+    }}
+
+    function installDrilldownGapObserver() {{
+        try {{
+            const parentWin = window.parent;
+            const parentDoc = parentWin.document;
+            const KEY = "__npiDashboardDrilldownGapControllerV1";
+            let controller = parentWin[KEY];
+            if (!controller) {{
+                controller = {{ observer: null, timer: null, sync: null }};
+                parentWin[KEY] = controller;
+            }}
+            controller.sync = syncDrilldownGap;
+            if (!controller.observer) {{
+                controller.observer = new parentWin.MutationObserver(function () {{
+                    if (controller.timer) parentWin.clearTimeout(controller.timer);
+                    controller.timer = parentWin.setTimeout(function () {{
+                        try {{ if (controller.sync) controller.sync(); }} catch (error) {{}}
+                    }}, 60);
+                }});
+                controller.observer.observe(parentDoc.body, {{ childList: true, subtree: true }});
+            }}
+            [0, 100, 300, 700, 1200].forEach(function (delay) {{
+                parentWin.setTimeout(function () {{
+                    try {{ if (controller.sync) controller.sync(); }} catch (error) {{}}
+                }}, delay);
+            }});
+        }} catch (error) {{}}
+    }}
+
+    function applyDashboardHeight(requestedHeight, persist) {{
+        const stage = document.getElementById("npi-floating-stage");
+        if (!stage) return DEFAULT_DASHBOARD_HEIGHT;
+        const minimum = getDashboardMinimumHeight();
+        const numeric = Number(requestedHeight);
+        const wanted = Number.isFinite(numeric) ? numeric : DEFAULT_DASHBOARD_HEIGHT;
+        const height = clamp(Math.max(wanted, minimum), minimum, MAX_DASHBOARD_HEIGHT);
+        stage.style.setProperty("height", height + "px", "important");
+        stage.style.setProperty("min-height", height + "px", "important");
+
+        // Resizing only the iframe's inner HTML does not change the reserved
+        // Streamlit layout height. Update the iframe, its immediate host, and the
+        // owning Streamlit element container so native Drilldown reflows with it.
+        try {{
+            const frame = window.frameElement;
+            if (frame) {{
+                const pxHeight = height + "px";
+                ["height", "min-height", "max-height"].forEach(function (property) {{
+                    frame.style.setProperty(property, pxHeight, "important");
+                }});
+                frame.style.setProperty("display", "block", "important");
+                frame.style.setProperty("box-sizing", "border-box", "important");
+
+                const frameHost = frame.parentElement;
+                if (frameHost && frameHost !== window.parent.document.body) {{
+                    ["height", "min-height", "max-height"].forEach(function (property) {{
+                        frameHost.style.setProperty(property, pxHeight, "important");
+                    }});
+                    frameHost.style.setProperty("box-sizing", "border-box", "important");
+                    frameHost.style.setProperty("overflow", "visible", "important");
+                }}
+
+                let elementContainer = frame;
+                while (elementContainer && elementContainer !== window.parent.document.body) {{
+                    if (elementContainer.getAttribute && elementContainer.getAttribute("data-testid") === "stElementContainer") break;
+                    elementContainer = elementContainer.parentElement;
+                }}
+                if (elementContainer && elementContainer !== window.parent.document.body) {{
+                    ["height", "min-height", "max-height"].forEach(function (property) {{
+                        elementContainer.style.setProperty(property, pxHeight, "important");
+                    }});
+                    elementContainer.style.setProperty("box-sizing", "border-box", "important");
+                    elementContainer.style.setProperty("margin-top", "0px", "important");
+                    // The regular Streamlit vertical gap is 16px; 4px bottom margin
+                    // makes the intended visible dashboard-to-Drilldown gap 20px.
+                    elementContainer.style.setProperty("margin-bottom", "4px", "important");
+                    elementContainer.style.setProperty("padding-top", "0px", "important");
+                    elementContainer.style.setProperty("padding-bottom", "0px", "important");
+                }}
+            }}
+        }} catch (error) {{}}
+
+        // The outer flow box has changed; realign the Drilldown after layout settles.
+        try {{ window.parent.requestAnimationFrame(syncDrilldownGap); }} catch (error) {{}}
+        try {{ window.parent.setTimeout(syncDrilldownGap, 40); }} catch (error) {{}}
+
+        if (persist) {{
+            try {{ localStorage.setItem(DASHBOARD_HEIGHT_KEY, String(height)); }} catch (error) {{}}
+            try {{ window.parent.localStorage.setItem(DASHBOARD_HEIGHT_KEY, String(height)); }} catch (error) {{}}
+        }}
+        return height;
+    }}
+
+    function setupDashboardBoundary() {{
+        const stage = document.getElementById("npi-floating-stage");
+        const boundary = document.getElementById("npi-dashboard-drilldown-boundary");
+        if (!stage || !boundary || boundary.dataset.npiBoundaryWired === "1") return;
+        boundary.dataset.npiBoundaryWired = "1";
+
+        applyDashboardHeight(readDashboardHeight(), false);
+        installDrilldownGapObserver();
+        let boundaryDrag = null;
+
+        boundary.addEventListener("pointerdown", function(event) {{
+            if (event.button !== undefined && event.button !== 0) return;
+            boundaryDrag = {{
+                startY: event.clientY,
+                startHeight: stage.clientHeight || DEFAULT_DASHBOARD_HEIGHT,
+                pointerId: event.pointerId
+            }};
+            try {{ boundary.setPointerCapture(event.pointerId); }} catch (error) {{}}
+            try {{ event.preventDefault(); }} catch (error) {{}}
+        }});
+
+        boundary.addEventListener("pointermove", function(event) {{
+            if (!boundaryDrag) return;
+            applyDashboardHeight(
+                boundaryDrag.startHeight + event.clientY - boundaryDrag.startY,
+                false
+            );
+            try {{ event.preventDefault(); }} catch (error) {{}}
+        }});
+
+        function finishBoundaryDrag() {{
+            if (!boundaryDrag) return;
+            boundaryDrag = null;
+            applyDashboardHeight(stage.clientHeight || DEFAULT_DASHBOARD_HEIGHT, true);
+        }}
+        boundary.addEventListener("pointerup", finishBoundaryDrag);
+        boundary.addEventListener("pointercancel", finishBoundaryDrag);
+    }}
+
+    /* ========================================================
        RESET BUTTON
        ======================================================== */
 
@@ -3748,6 +4906,7 @@ body {{
 
 
         loadLayout();
+        setupDashboardBoundary();
 
         wireLegend();
 
@@ -3756,6 +4915,8 @@ body {{
         wireDelayBucketTiles();
 
         wireHotspotRows();
+
+        wireDelayCommitmentTiles();
 
         wireReset();
 
@@ -3806,10 +4967,378 @@ body {{
 
     components.html(
         floating_html,
-        height=470,
+        height=553,
         scrolling=False,
     )
 
+    # The floating dashboard is rendered in an HTML iframe. Native Streamlit
+    # widgets cannot be reliably driven from that iframe by synthetic DOM events,
+    # so the live search form is rendered as native Streamlit controls immediately
+    # below the floating dashboard. Its submit callback runs before the next app
+    # rerun, allowing the Drilldown to update using the same unique-part dataset.
+    with st.container(key="npi_enquiry_search_section", border=True):
+        st.markdown("### ENQUIRY FINDER")
+        st.caption("One full part number per line.")
+        with st.form("npi_enquiry_search_form", clear_on_submit=False):
+            st.text_area(
+                "Full part number(s)",
+                key="enquiry_input_text",
+                height=60,
+                placeholder="PART-001\nPART-002\nPART-003",
+                help="Enter one full part number per line. The box scrolls for long lists; blank lines and duplicate entries are ignored.",
+                label_visibility="collapsed",
+            )
+            st.form_submit_button(
+                "SEARCH",
+                type="primary",
+                use_container_width=True,
+                on_click=_run_enquiry_search,
+            )
+        search_message = st.session_state.get("enquiry_search_message", "")
+        if search_message:
+            st.caption(search_message)
+
+    # Float the real Streamlit form as an absolutely-positioned child of the
+    # shared content area. Absolute positioning lets it scroll with the page,
+    # while its coordinates remain relative to the floating dashboard stage.
+    # Rebind handlers on reruns so an earlier controller cannot pin the panel.
+    components.html(
+        """
+        <script>
+        (function () {
+            try {
+                const parentWin = window.parent;
+                const parentDoc = parentWin.document;
+                const CONTROLLER_KEY = "__npiEnquiryFinderFloatControllerV3";
+                const LEGACY_KEY = "__npiEnquiryFinderFloatController";
+                const STORAGE_KEY = "npiEnquiryFinderLayoutV1";
+
+                // This tiny components.html iframe only installs drag/resize listeners.
+                // Keep its script active but take its wrapper out of page flow so it
+                // does not add another vertical gap before the Drilldown.
+                try {
+                    const controllerFrame = window.frameElement;
+                    if (controllerFrame) {
+                        controllerFrame.style.setProperty("position", "absolute", "important");
+                        controllerFrame.style.setProperty("left", "0px", "important");
+                        controllerFrame.style.setProperty("top", "0px", "important");
+                        controllerFrame.style.setProperty("width", "1px", "important");
+                        controllerFrame.style.setProperty("height", "1px", "important");
+                        controllerFrame.style.setProperty("min-height", "1px", "important");
+                        controllerFrame.style.setProperty("opacity", "0", "important");
+                        controllerFrame.style.setProperty("pointer-events", "none", "important");
+                        let controllerBlock = controllerFrame;
+                        while (controllerBlock && controllerBlock !== parentDoc.body) {
+                            if (controllerBlock.getAttribute && controllerBlock.getAttribute("data-testid") === "stElementContainer") break;
+                            controllerBlock = controllerBlock.parentElement;
+                        }
+                        if (controllerBlock && controllerBlock !== parentDoc.body) {
+                            controllerBlock.style.setProperty("position", "absolute", "important");
+                            controllerBlock.style.setProperty("left", "0px", "important");
+                            controllerBlock.style.setProperty("top", "0px", "important");
+                            controllerBlock.style.setProperty("width", "1px", "important");
+                            controllerBlock.style.setProperty("height", "1px", "important");
+                            controllerBlock.style.setProperty("min-height", "1px", "important");
+                            controllerBlock.style.setProperty("max-height", "1px", "important");
+                            controllerBlock.style.setProperty("margin", "0px", "important");
+                            controllerBlock.style.setProperty("padding", "0px", "important");
+                            controllerBlock.style.setProperty("overflow", "hidden", "important");
+                        }
+                    }
+                } catch (e) {}
+
+                // Retire the prior fixed-position controller, whose old scroll
+                // listeners can otherwise keep re-applying viewport coordinates.
+                const legacy = parentWin[LEGACY_KEY];
+                if (legacy) {
+                    try { if (legacy.observer) legacy.observer.disconnect(); } catch (e) {}
+                    try { if (legacy.resizeObserver) legacy.resizeObserver.disconnect(); } catch (e) {}
+                    try { if (legacy.observerTimer) parentWin.clearTimeout(legacy.observerTimer); } catch (e) {}
+                    legacy.container = null;
+                    legacy.drag = null;
+                    legacy.retired = true;
+                }
+
+                function removeStoredListeners(target, handlers) {
+                    if (!target || !handlers) return;
+                    try { if (handlers.pointerdown) target.removeEventListener("pointerdown", handlers.pointerdown, true); } catch (e) {}
+                    try { if (handlers.pointermove) target.removeEventListener("pointermove", handlers.pointermove, true); } catch (e) {}
+                    try { if (handlers.pointerup) target.removeEventListener("pointerup", handlers.pointerup, true); } catch (e) {}
+                    try { if (handlers.pointercancel) target.removeEventListener("pointercancel", handlers.pointercancel, true); } catch (e) {}
+                    try { if (handlers.resize) parentWin.removeEventListener("resize", handlers.resize); } catch (e) {}
+                }
+
+                let state = parentWin[CONTROLLER_KEY];
+                if (!state) {
+                    let savedLayout = null;
+                    try { savedLayout = JSON.parse(parentWin.localStorage.getItem(STORAGE_KEY) || "null"); } catch (e) {}
+                    const defaults = { left: 12, top: 5, width: 282, height: 190 };
+                    const layout = Object.assign({}, defaults, savedLayout || {});
+                    ["left", "top", "width", "height"].forEach(function (key) {
+                        const value = Number(layout[key]);
+                        layout[key] = Number.isFinite(value) ? value : defaults[key];
+                    });
+                    state = {
+                        layout: layout,
+                        container: null,
+                        drag: null,
+                        observer: null,
+                        observerTimer: null,
+                        resizeObserver: null,
+                        saveTimer: null,
+                        listenerDocument: null,
+                        handlers: null
+                    };
+                    parentWin[CONTROLLER_KEY] = state;
+                }
+
+                // components.html may execute again while the parent document
+                // remains alive. Remove this controller's old handlers and
+                // observers before binding handlers to the current app DOM.
+                removeStoredListeners(state.listenerDocument, state.handlers);
+                try { if (state.observer) state.observer.disconnect(); } catch (e) {}
+                try { if (state.resizeObserver) state.resizeObserver.disconnect(); } catch (e) {}
+                try { if (state.observerTimer) parentWin.clearTimeout(state.observerTimer); } catch (e) {}
+                state.observer = null;
+                state.resizeObserver = null;
+                state.drag = null;
+                state.listenerDocument = parentDoc;
+                state.handlers = null;
+
+                function getDashboardFrame() {
+                    const frames = parentDoc.querySelectorAll("iframe");
+                    for (const frame of frames) {
+                        try {
+                            if (frame.contentDocument && frame.contentDocument.getElementById("npi-floating-stage")) return frame;
+                        } catch (e) {}
+                    }
+                    return null;
+                }
+
+                function getPanel() {
+                    return parentDoc.querySelector('div[class*="st-key-npi_enquiry_search_section"]');
+                }
+
+                function collapseOriginalFinderFlow(panel) {
+                    if (!panel) return;
+                    let node = panel;
+                    for (let depth = 0; node && node !== parentDoc.body && depth < 12; depth++, node = node.parentElement) {
+                        if (node.getAttribute && node.getAttribute("data-testid") === "stElementContainer") {
+                            // Keep the native form DOM alive for Streamlit callbacks but remove its
+                            // old placeholder height from normal page flow. The panel itself is
+                            // absolutely positioned over the floating dashboard by positionPanel().
+                            node.style.setProperty("display", "contents", "important");
+                            node.style.setProperty("height", "0px", "important");
+                            node.style.setProperty("min-height", "0px", "important");
+                            node.style.setProperty("margin", "0px", "important");
+                            node.style.setProperty("padding", "0px", "important");
+                            node.style.setProperty("overflow", "visible", "important");
+                            return;
+                        }
+                    }
+                }
+
+                function findSharedRoot(frame, panel) {
+                    let candidate = panel;
+                    while (candidate && candidate !== parentDoc.body) {
+                        if (candidate.contains(frame)) return candidate;
+                        candidate = candidate.parentElement;
+                    }
+                    return parentDoc.querySelector('[data-testid="stMainBlockContainer"]') || parentDoc.body;
+                }
+
+                function getMetrics(panel) {
+                    const frame = getDashboardFrame();
+                    if (!frame || !panel) return null;
+                    let stage = null;
+                    try { stage = frame.contentDocument.getElementById("npi-floating-stage"); } catch (e) {}
+                    if (!stage) return null;
+                    const frameRect = frame.getBoundingClientRect();
+                    const stageRect = stage.getBoundingClientRect();
+                    const sharedRoot = findSharedRoot(frame, panel);
+                    if (sharedRoot && sharedRoot !== parentDoc.body) {
+                        try {
+                            if (parentWin.getComputedStyle(sharedRoot).position === "static") {
+                                sharedRoot.style.setProperty("position", "relative", "important");
+                            }
+                        } catch (e) {}
+                    }
+                    return {
+                        frame: frame,
+                        frameRect: frameRect,
+                        stageRect: stageRect,
+                        root: sharedRoot,
+                        width: Math.max(1, stage.clientWidth || frame.clientWidth || stageRect.width),
+                        height: Math.max(1, stage.clientHeight || 455)
+                    };
+                }
+
+                function clamp(value, minimum, maximum) {
+                    return Math.max(minimum, Math.min(maximum, value));
+                }
+
+                function saveLayout() {
+                    try {
+                        if (state.saveTimer) parentWin.clearTimeout(state.saveTimer);
+                        state.saveTimer = parentWin.setTimeout(function () {
+                            try { parentWin.localStorage.setItem(STORAGE_KEY, JSON.stringify(state.layout)); } catch (e) {}
+                        }, 120);
+                    } catch (e) {}
+                }
+
+                function positionPanel(panel) {
+                    const metrics = getMetrics(panel);
+                    if (!metrics || !panel) return false;
+                    const width = Math.min(state.layout.width, metrics.width);
+                    const height = Math.min(state.layout.height, metrics.height);
+                    state.layout.width = Math.max(250, width);
+                    state.layout.height = Math.max(160, height);
+                    state.layout.left = clamp(state.layout.left, 0, Math.max(0, metrics.width - state.layout.width));
+                    state.layout.top = clamp(state.layout.top, 0, Math.max(0, metrics.height - state.layout.height));
+
+                    // Use the actual offset parent as the positioning coordinate
+                    // system. The panel is absolute, not fixed, so normal page
+                    // scrolling moves it together with the dashboard content.
+                    panel.style.setProperty("position", "absolute", "important");
+                    const offsetParent = panel.offsetParent || metrics.root || parentDoc.body;
+                    const parentRect = offsetParent.getBoundingClientRect();
+                    const left = metrics.frameRect.left + metrics.stageRect.left - parentRect.left
+                        + (offsetParent.scrollLeft || 0) - (offsetParent.clientLeft || 0) + state.layout.left;
+                    const top = metrics.frameRect.top + metrics.stageRect.top - parentRect.top
+                        + (offsetParent.scrollTop || 0) - (offsetParent.clientTop || 0) + state.layout.top;
+
+                    panel.style.setProperty("left", left + "px", "important");
+                    panel.style.setProperty("top", top + "px", "important");
+                    panel.style.setProperty("width", state.layout.width + "px", "important");
+                    panel.style.setProperty("height", state.layout.height + "px", "important");
+                    panel.style.setProperty("min-width", "250px", "important");
+                    panel.style.setProperty("min-height", "160px", "important");
+                    panel.style.setProperty("max-width", Math.max(250, metrics.width - state.layout.left) + "px", "important");
+                    panel.style.setProperty("max-height", Math.max(160, metrics.height - state.layout.top) + "px", "important");
+                    panel.style.setProperty("overflow", "auto", "important");
+                    panel.style.setProperty("resize", "both", "important");
+                    panel.style.setProperty("z-index", "2147483000", "important");
+                    panel.style.setProperty("box-sizing", "border-box", "important");
+                    panel.style.setProperty("background", "#FFFFFF", "important");
+                    panel.style.setProperty("border", "1px solid #C9CDD3", "important");
+                    panel.style.setProperty("border-radius", "8px", "important");
+                    panel.style.setProperty("box-shadow", "0 2px 8px rgba(0,0,0,0.18)", "important");
+                    panel.style.setProperty("padding", "8px", "important");
+
+                    panel.querySelectorAll('[data-testid="stVerticalBlock"]').forEach(function (block) {
+                        block.style.setProperty("gap", "0.3rem", "important");
+                    });
+                    const heading = panel.querySelector("h3");
+                    if (heading) {
+                        heading.style.setProperty("cursor", state.drag ? "grabbing" : "grab", "important");
+                        heading.style.setProperty("user-select", "none", "important");
+                        heading.style.setProperty("touch-action", "none", "important");
+                        heading.style.setProperty("font-size", "13px", "important");
+                        heading.style.setProperty("line-height", "18px", "important");
+                        heading.style.setProperty("margin", "-8px -8px 4px -8px", "important");
+                        heading.style.setProperty("padding", "7px 9px", "important");
+                        heading.style.setProperty("background", "#EEF0F2", "important");
+                        heading.style.setProperty("border-bottom", "1px solid #D6D9DD", "important");
+                    }
+                    return true;
+                }
+
+                function ensurePanel() {
+                    const panel = getPanel();
+                    if (!panel) return;
+                    collapseOriginalFinderFlow(panel);
+                    if (state.container !== panel) {
+                        try { if (state.resizeObserver) state.resizeObserver.disconnect(); } catch (e) {}
+                        state.resizeObserver = null;
+                        state.container = panel;
+                    }
+                    if (!state.drag) positionPanel(panel);
+                    if (!state.resizeObserver && parentWin.ResizeObserver) {
+                        state.resizeObserver = new parentWin.ResizeObserver(function () {
+                            if (!state.container || state.drag) return;
+                            const rect = state.container.getBoundingClientRect();
+                            const width = Math.round(rect.width);
+                            const height = Math.round(rect.height);
+                            if (width >= 250 && Math.abs(width - state.layout.width) > 2) state.layout.width = width;
+                            if (height >= 160 && Math.abs(height - state.layout.height) > 2) state.layout.height = height;
+                            saveLayout();
+                            positionPanel(state.container);
+                        });
+                        state.resizeObserver.observe(panel);
+                    }
+                }
+
+                const handlers = {
+                    pointerdown: function (event) {
+                        if (event.button !== undefined && event.button !== 0) return;
+                        const target = event.target && event.target.nodeType === 1 ? event.target : null;
+                        const panel = state.container || getPanel();
+                        if (!target || !panel || !panel.contains(target)) return;
+                        const heading = target.closest("h3");
+                        if (!heading || !panel.contains(heading)) return;
+                        const metrics = getMetrics(panel);
+                        if (!metrics) return;
+                        state.drag = {
+                            startX: event.clientX,
+                            startY: event.clientY,
+                            startLeft: state.layout.left,
+                            startTop: state.layout.top,
+                            pointerId: event.pointerId
+                        };
+                        heading.style.setProperty("cursor", "grabbing", "important");
+                        try { event.preventDefault(); } catch (e) {}
+                    },
+                    pointermove: function (event) {
+                        if (!state.drag) return;
+                        const panel = state.container || getPanel();
+                        const metrics = getMetrics(panel);
+                        if (!metrics) return;
+                        state.layout.left = clamp(state.drag.startLeft + event.clientX - state.drag.startX, 0, Math.max(0, metrics.width - state.layout.width));
+                        state.layout.top = clamp(state.drag.startTop + event.clientY - state.drag.startY, 0, Math.max(0, metrics.height - state.layout.height));
+                        if (panel) positionPanel(panel);
+                    },
+                    pointerup: function () {
+                        if (!state.drag) return;
+                        state.drag = null;
+                        saveLayout();
+                        if (state.container) positionPanel(state.container);
+                    },
+                    pointercancel: function () {
+                        if (!state.drag) return;
+                        state.drag = null;
+                        saveLayout();
+                        if (state.container) positionPanel(state.container);
+                    },
+                    resize: function () {
+                        if (state.container && !state.drag) positionPanel(state.container);
+                    }
+                };
+                state.handlers = handlers;
+                state.listenerDocument = parentDoc;
+                parentDoc.addEventListener("pointerdown", handlers.pointerdown, true);
+                parentDoc.addEventListener("pointermove", handlers.pointermove, true);
+                parentDoc.addEventListener("pointerup", handlers.pointerup, true);
+                parentDoc.addEventListener("pointercancel", handlers.pointercancel, true);
+                parentWin.addEventListener("resize", handlers.resize);
+
+                ensurePanel();
+                state.observer = new parentWin.MutationObserver(function () {
+                    if (state.observerTimer) parentWin.clearTimeout(state.observerTimer);
+                    state.observerTimer = parentWin.setTimeout(ensurePanel, 80);
+                });
+                state.observer.observe(parentDoc.body, { childList: true, subtree: true });
+                [100, 300, 700, 1200].forEach(function (delay) {
+                    parentWin.setTimeout(ensurePanel, delay);
+                });
+            } catch (error) {
+                // The normal native Streamlit form remains available if floating setup fails.
+            }
+        })();
+        </script>
+        """,
+        height=1,
+        scrolling=False,
+    )
 
 
 def build_delay_bucket_summary(df):
@@ -4002,6 +5531,7 @@ def render_drilldown(df, title):
     CUS
     PART NO
     PICTURE
+    QTY
     PO NUMBER
     ENGINEER
     JOB NO
@@ -4012,17 +5542,14 @@ def render_drilldown(df, title):
     AGING
     PRIORITY
     COMMITMENT
-        Owner
-        Action
-        Support Required
-        Commitment Date
-        Action Status
-        Actual Completion
-        Remarks
+        OWNER
+        COMMITMENT DATE
+        COMPLETION DATE
+        REMARK
 
     Layout:
     - First 3 columns are horizontally frozen.
-    - Horizontal scroll begins after PICTURE.
+    - The first 3 columns remain frozen; QTY follows PICTURE in the scrollable area.
     - Two-level header is preserved.
     - PART NO width follows actual part number.
     - Other columns are controlled by heading/subheading width.
@@ -4081,6 +5608,17 @@ def render_drilldown(df, title):
         ],
     )
 
+    qty_col = first_existing_column(
+        df,
+        [
+            "Subpart Qty",
+            "SUBPART QTY",
+            "Subpart Quantity",
+            "QTY",
+            "Qty",
+        ],
+    )
+
     po_col = first_existing_column(
         df,
         [
@@ -4133,11 +5671,132 @@ def render_drilldown(df, title):
         df
     )
 
+    # Prepare a single-line header. The Current Process popover must be created
+    # before sorting/pagination so its selection can filter the data on this run.
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-drilldown_compact_header"] {
+            width: 100% !important;
+            max-width: 100% !important;
+        }
+        div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] {
+            display: flex !important;
+            flex-wrap: nowrap !important;
+            align-items: center !important;
+            gap: 0.55rem !important;
+            width: 100% !important;
+        }
+        div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] > [data-testid="column"] {
+            min-width: 0 !important;
+            max-width: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+        }
+        div[class*="st-key-drilldown_compact_header"] [data-testid="stButton"] button,
+        div[class*="st-key-drilldown_compact_header"] [data-testid="stPopover"] button {
+            min-height: 1.8rem !important;
+            height: 1.8rem !important;
+            padding: 0 0.4rem !important;
+            white-space: nowrap !important;
+        }
+        div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"] [data-testid="stHorizontalBlock"] {
+            gap: 0.2rem !important;
+            width: 100% !important;
+        }
+        div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"] [data-testid="column"] {
+            min-width: 0 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    current_process_filter_key = "drilldown_current_process_filter"
+    process_options = ["ALL"]
+    if current_col and current_col in df.columns:
+        process_values = (
+            df[current_col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+        )
+        process_options.extend(
+            sorted(
+                value for value in process_values.unique().tolist()
+                if value and value.lower() not in {"nan", "none"}
+            )
+        )
+
+    if st.session_state.get(current_process_filter_key, "ALL") not in process_options:
+        st.session_state[current_process_filter_key] = "ALL"
+
+    selected_current_process = st.session_state.get(current_process_filter_key, "ALL")
+
+    with st.container(key="drilldown_compact_header"):
+        header_cols = st.columns(
+            [3.0, 1.8, 1.9, 3.1, 2.5, 2.5],
+            vertical_alignment="center",
+            gap="small",
+        )
+        header_title_slot = header_cols[0].empty()
+        header_customer_slot = header_cols[1].empty()
+        header_process_slot = header_cols[2].empty()
+        header_page_slot = header_cols[3].empty()
+        header_records_slot = header_cols[4].empty()
+        header_export_slot = header_cols[5].empty()
+
+        with header_process_slot.container():
+            with st.popover(
+                "Current Process",
+                key="drilldown_current_process_popover",
+                use_container_width=True,
+            ):
+                st.caption(
+                    "Active filter: "
+                    + (selected_current_process if selected_current_process != "ALL" else "ALL processes")
+                )
+
+                def _reset_current_process_filter():
+                    st.session_state[current_process_filter_key] = "ALL"
+                    for state_key in list(st.session_state.keys()):
+                        if str(state_key).startswith("drilldown_page_state_"):
+                            st.session_state[state_key] = 1
+
+                st.selectbox(
+                    "Current Process",
+                    process_options,
+                    key=current_process_filter_key,
+                    label_visibility="collapsed",
+                    on_change=lambda: [
+                        st.session_state.__setitem__(state_key, 1)
+                        for state_key in list(st.session_state.keys())
+                        if str(state_key).startswith("drilldown_page_state_")
+                    ],
+                )
+                st.button(
+                    "Clear process filter",
+                    key="drilldown_clear_current_process_filter",
+                    use_container_width=True,
+                    on_click=_reset_current_process_filter,
+                )
+
+    selected_current_process = st.session_state.get(current_process_filter_key, "ALL")
+    if selected_current_process != "ALL" and current_col and current_col in df.columns:
+        df = df[
+            df[current_col].fillna("").astype(str).str.strip().eq(selected_current_process)
+        ].copy()
+
     # ========================================================
     # SORT
     # ========================================================
 
     display_df = df.copy()
+
+    # Keep the header count aligned with the extra Current Process filter.
+    if selected_current_process != "ALL":
+        title_prefix = title.rsplit(" (", 1)[0] if title.endswith(")") and " (" in title else title
+        title = f"{title_prefix} ({len(display_df):,})"
 
     if (
         delay_col
@@ -4189,109 +5848,59 @@ def render_drilldown(df, title):
     page = max(1, min(page, total_pages))
     st.session_state[page_state_key] = page
 
-    # Responsive single-row Drilldown header. The control date is intentionally
-    # omitted here; the Excel export sits in the same row as the title/controls.
-    st.markdown(
-        """
-        <style>
-        div[class*="st-key-drilldown_compact_header"] {
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] {
-            display: flex !important;
-            flex-wrap: nowrap !important;
-            align-items: center !important;
-            gap: 0.55rem !important;
-            width: 100% !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] > [data-testid="column"] {
-            flex: 1 1 0 !important;
-            width: 0 !important;
-            min-width: 0 !important;
-            max-width: none !important;
-            padding: 0 !important;
-            margin: 0 !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] [data-testid="stButton"] button {
-            min-height: 1.8rem !important;
-            height: 1.8rem !important;
-            padding: 0 0.4rem !important;
-            white-space: nowrap !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"] [data-testid="stHorizontalBlock"] {
-            gap: 0.2rem !important;
-            width: 100% !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"] [data-testid="stHorizontalBlock"] > [data-testid="column"] {
-            flex: 1 1 0 !important;
-            width: 0 !important;
-            min-width: 0 !important;
-        }
-        </style>
-        """,
+    # Fill the header placeholders after the current-process filter and
+    # pagination totals have been calculated. The export remains on this row.
+    meta_style = "font-size:14px;color:#666;white-space:nowrap;line-height:1.3;"
+    header_title_slot.markdown(
+        f"<div style='font-size:18px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
+        f"{html_escape(title)}</div>",
+        unsafe_allow_html=True,
+    )
+    header_customer_slot.markdown(
+        f"<div style='{meta_style}overflow:hidden;text-overflow:ellipsis;'>CUSTOMER: "
+        f"{html_escape(str(customer_display))}</div>",
         unsafe_allow_html=True,
     )
 
-    meta_style = "font-size:14px;color:#666;white-space:nowrap;line-height:1.3;"
-
-    with st.container(key="drilldown_compact_header"):
-        header_cols = st.columns(
-            [3.0, 1.8, 3.1, 2.5, 2.5],
+    with header_page_slot.container():
+        page_controls = st.columns(
+            [1.2, 0.45, 0.85, 0.45, 0.65],
             vertical_alignment="center",
             gap="small",
         )
-
-        header_cols[0].markdown(
-            f"<div style='font-size:18px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
-            f"{html_escape(title)}</div>",
+        page_controls[0].button(
+            "First …",
+            key=f"drilldown_first_page_{title}",
+            disabled=(page <= 1),
+            on_click=lambda k=page_state_key: st.session_state.__setitem__(k, 1),
+        )
+        page_controls[1].button(
+            "−",
+            key=f"drilldown_prev_page_{title}",
+            disabled=(page <= 1),
+            on_click=lambda k=page_state_key, p=page: st.session_state.__setitem__(k, max(1, p - 1)),
+        )
+        page_controls[2].markdown(
+            f"<div style='{meta_style}text-align:center;'>Page {page}</div>",
             unsafe_allow_html=True,
         )
-        header_cols[1].markdown(
-            f"<div style='{meta_style}overflow:hidden;text-overflow:ellipsis;'>CUSTOMER: "
-            f"{html_escape(str(customer_display))}</div>",
+        page_controls[3].button(
+            "+",
+            key=f"drilldown_next_page_{title}",
+            disabled=(page >= total_pages),
+            on_click=lambda k=page_state_key, p=page, n=total_pages: st.session_state.__setitem__(k, min(n, p + 1)),
+        )
+        page_controls[4].markdown(
+            f"<div style='{meta_style}'>of {total_pages}</div>",
             unsafe_allow_html=True,
         )
 
-        with header_cols[2]:
-            page_controls = st.columns(
-                [1.2, 0.45, 0.85, 0.45, 0.65],
-                vertical_alignment="center",
-                gap="small",
-            )
-            page_controls[0].button(
-                "First …",
-                key=f"drilldown_first_page_{title}",
-                disabled=(page <= 1),
-                on_click=lambda k=page_state_key: st.session_state.__setitem__(k, 1),
-            )
-            page_controls[1].button(
-                "−",
-                key=f"drilldown_prev_page_{title}",
-                disabled=(page <= 1),
-                on_click=lambda k=page_state_key, p=page: st.session_state.__setitem__(k, max(1, p - 1)),
-            )
-            page_controls[2].markdown(
-                f"<div style='{meta_style}text-align:center;'>Page {page}</div>",
-                unsafe_allow_html=True,
-            )
-            page_controls[3].button(
-                "+",
-                key=f"drilldown_next_page_{title}",
-                disabled=(page >= total_pages),
-                on_click=lambda k=page_state_key, p=page, n=total_pages: st.session_state.__setitem__(k, min(n, p + 1)),
-            )
-            page_controls[4].markdown(
-                f"<div style='{meta_style}'>of {total_pages}</div>",
-                unsafe_allow_html=True,
-            )
-
-        header_cols[3].markdown(
-            f"<div style='{meta_style}overflow:hidden;text-overflow:ellipsis;'>Showing "
-            f"{(page - 1) * page_size + 1:,}–"
-            f"{min(page * page_size, total_rows):,} of {total_rows:,} records</div>",
-            unsafe_allow_html=True,
-        )
+    header_records_slot.markdown(
+        f"<div style='{meta_style}overflow:hidden;text-overflow:ellipsis;'>Showing "
+        f"{(page - 1) * page_size + 1:,}–"
+        f"{min(page * page_size, total_rows):,} of {total_rows:,} records</div>",
+        unsafe_allow_html=True,
+    )
 
 
     start_idx = (page - 1) * page_size
@@ -4446,6 +6055,12 @@ def render_drilldown(df, title):
             "type": "picture",
         },
         {
+            "key": "qty",
+            "heading": "QTY",
+            "source": qty_col,
+            "type": "number",
+        },
+        {
             "key": "po_number",
             "heading": "PO NUMBER",
             "source": po_col,
@@ -4504,31 +6119,19 @@ def render_drilldown(df, title):
     commitment_columns = [
         {
             "key": "owner",
-            "heading": "Owner",
-        },
-        {
-            "key": "action",
-            "heading": "Action",
-        },
-        {
-            "key": "support_required",
-            "heading": "Support Required",
+            "heading": "OWNER",
         },
         {
             "key": "commitment_date",
-            "heading": "Commitment Date",
-        },
-        {
-            "key": "action_status",
-            "heading": "Action Status",
+            "heading": "COMMITMENT DATE",
         },
         {
             "key": "actual_completion",
-            "heading": "Actual Completion",
+            "heading": "COMPLETION DATE",
         },
         {
             "key": "remarks",
-            "heading": "Remarks",
+            "heading": "REMARK",
         },
     ]
 
@@ -4592,6 +6195,7 @@ def render_drilldown(df, title):
         "CUS": 65,
         "PART NO": part_width_px,
         "PICTURE": 95,
+        "QTY": 70,
         "PO NUMBER": 115,
         "ENGINEER": 105,
         "JOB NO": 100,
@@ -4602,13 +6206,10 @@ def render_drilldown(df, title):
         "AGING": 80,
         "PRIORITY": 80,
 
-        "Owner": 100,
-        "Action": 180,
-        "Support Required": 180,
-        "Commitment Date": 125,
-        "Action Status": 120,
-        "Actual Completion": 130,
-        "Remarks": 180,
+        "OWNER": 100,
+        "COMMITMENT DATE": 125,
+        "COMPLETION DATE": 130,
+        "REMARK": 180,
     }
 
     # ========================================================
@@ -4654,7 +6255,7 @@ def render_drilldown(df, title):
         center_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
         body_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-        # Two-level header: fixed columns span both header rows; COMMITMENT spans seven subcolumns.
+        # Two-level header: fixed columns span both header rows; COMMITMENT spans the requested subcolumns.
         for col_index, col in enumerate(fixed_columns, start=1):
             cell = worksheet.cell(row=1, column=col_index, value=col["heading"])
             cell.fill = header_fill
@@ -4765,7 +6366,7 @@ def render_drilldown(df, title):
         worksheet.freeze_panes = "A3"
         excel_buffer = BytesIO()
         workbook.save(excel_buffer)
-        header_cols[4].download_button(
+        header_export_slot.download_button(
             "Download Drilldown Excel",
             data=excel_buffer.getvalue(),
             file_name="NPI_Control_Tower_Drilldown.xlsx",
@@ -4774,7 +6375,7 @@ def render_drilldown(df, title):
             use_container_width=True,
         )
     except Exception as exc:
-        header_cols[4].warning(f"Excel export is unavailable: {exc}")
+        header_export_slot.warning(f"Excel export is unavailable: {exc}")
 
     # ========================================================
     # HEADER / ROW HEIGHTS
@@ -4960,7 +6561,7 @@ def render_drilldown(df, title):
     html_parts.append(
         f"""
         <th
-            colspan="7"
+            colspan="{len(commitment_columns)}"
             style="
                 width:{commitment_total_width}px;
                 min-width:{commitment_total_width}px;
@@ -5588,9 +7189,16 @@ def render_control_tower():
         # must clear any previous classification selection.
         st.session_state.selected_classification = "ALL"
         st.session_state["selected_delay_bucket"] = ""
-        # A hotspot selection belongs to the previous customer's context.
-        # Clear it so the new customer starts with ALL unique parts.
+        # A hotspot / commitment selection belongs to the previous customer's context.
+        # Clear them so the new customer starts with ALL unique parts.
         st.session_state["selected_hotspot"] = ""
+        st.session_state["selected_commitment_status"] = ""
+        st.session_state["drilldown_current_process_filter"] = "ALL"
+        st.session_state["enquiry_search_active"] = False
+        st.session_state["selected_enquiry_parts"] = []
+
+        # Save the updated customer context before the explicit rerun.
+        _save_persistent_state()
 
         # Discard any stale donut URL event before rerunning.
         if "npi_exec" in st.query_params:
@@ -5602,6 +7210,8 @@ def render_control_tower():
             if str(page_key).startswith("drilldown_page_state_"):
                 st.session_state[page_key] = 1
 
+        # Save updated customer/filter context before the explicit rerun.
+        _save_persistent_state()
         st.rerun()
 
     # IMPORTANT:
@@ -5634,90 +7244,8 @@ def render_control_tower():
         hotspot_df=hotspot,
     )
 
-    st.divider()
-
-    # --------------------------------------------------------
-    # MANAGEMENT ACTION SUMMARY
-    # --------------------------------------------------------
-
-    st.markdown(
-        "### MANAGEMENT ACTION"
-    )
-
-    actions_df = (
-        st.session_state.actions_df
-    )
-
-    open_action = 0
-    overdue = 0
-    due_today = 0
-    upcoming = 0
-    no_commitment = 0
-
-    if (
-        actions_df is not None
-        and not actions_df.empty
-    ):
-
-        for _, action_row in (
-            actions_df.iterrows()
-        ):
-
-            status = (
-                calculate_commitment_status(
-                    action_row.get(
-                        "COMMITMENT_DATE"
-                    ),
-                    action_row.get(
-                        "ACTION_STATUS"
-                    ),
-                    control_date,
-                )
-            )
-
-            if status != "COMPLETED":
-                open_action += 1
-
-            if status == "OVERDUE":
-                overdue += 1
-
-            elif status == "DUE TODAY":
-                due_today += 1
-
-            elif status == "UPCOMING":
-                upcoming += 1
-
-            elif status == "NO COMMITMENT":
-                no_commitment += 1
-
-    action_cols = st.columns(5)
-
-    action_cols[0].metric(
-        "OPEN ACTION",
-        open_action,
-    )
-
-    action_cols[1].metric(
-        "OVERDUE",
-        overdue,
-    )
-
-    action_cols[2].metric(
-        "DUE TODAY",
-        due_today,
-    )
-
-    action_cols[3].metric(
-        "UPCOMING",
-        upcoming,
-    )
-
-    action_cols[4].metric(
-        "NO COMMITMENT",
-        no_commitment,
-    )
-
-    st.divider()
+    # The floating dashboard now ends at a draggable boundary. Do not add
+    # legacy Management Action dividers or whitespace before the Drilldown.
 
     # --------------------------------------------------------
     # DRILLDOWN
@@ -5734,45 +7262,91 @@ def render_control_tower():
         )
     )
 
-    selected_delay_bucket = st.session_state.get("selected_delay_bucket", "")
-    if selected_delay_bucket:
-        bucket_col = first_existing_column(
-            drill_df,
-            ["CALC_PRODUCTION_DELAY_BUCKET", "Production Delay Bucket", "Part Delay Days Bucket"],
+    selected_commitment_status = st.session_state.get("selected_commitment_status", "")
+    if selected_commitment_status:
+        commitment_status_map = build_delay_commitment_status_map(
+            tower_unique,
+            st.session_state.get("actions_df"),
+            control_date,
         )
-        if bucket_col is not None:
-            def _normalize_delay_bucket(value):
-                value = str(value).strip().lower()
-                for dash in ("–", "—", "−"):
-                    value = value.replace(dash, "-")
-                return " ".join(value.split())
-
-            selected_norm = _normalize_delay_bucket(selected_delay_bucket)
+        matching_commitment_parts = {
+            part_key for part_key, status in commitment_status_map.items()
+            if status == selected_commitment_status
+        }
+        commitment_part_col = first_existing_column(
+            drill_df,
+            ["PART NUMBER", "Part Number", "Subpart Part Num", "PART", "Part"],
+        )
+        if commitment_part_col and matching_commitment_parts:
             drill_df = drill_df[
-                drill_df[bucket_col].astype(str).map(_normalize_delay_bucket).eq(selected_norm)
+                drill_df[commitment_part_col].map(normalize_part_number).isin(
+                    matching_commitment_parts
+                )
             ].copy()
-            # A delay bucket contains RED - PRODUCTION parts only.
-            class_col = first_existing_column(
-                drill_df, ["CALC_CLASSIFICATION", "CLASSIFICATION"]
-            )
-            if class_col is not None:
-                drill_df = drill_df[
-                    drill_df[class_col].fillna("").astype(str).str.strip().str.upper()
-                    == "RED - PRODUCTION"
-                ].copy()
-        drill_title = f"{selected_delay_bucket} ({len(drill_df):,})"
-    elif st.session_state.get("selected_hotspot", ""):
-        selected_hotspot = st.session_state["selected_hotspot"]
-        current_col = get_current_column(drill_df)
-        if current_col is not None:
-            drill_df = drill_df[
-                drill_df[current_col].fillna("").astype(str).str.strip().eq(selected_hotspot)
-            ].copy()
-        drill_title = f"PRODUCTION HOTSPOT: {selected_hotspot} ({len(drill_df):,})"
-    elif selected_classification == "ALL":
-        drill_title = f"ALL UNIQUE PARTS ({len(drill_df):,})"
+        else:
+            drill_df = drill_df.iloc[0:0].copy()
+        drill_title = f"DELAY COMMITMENT: {selected_commitment_status} ({len(drill_df):,})"
     else:
-        drill_title = f"{selected_classification} ({len(drill_df):,})"
+        enquiry_search_active = bool(
+            st.session_state.get("enquiry_search_active", False)
+        )
+        if enquiry_search_active:
+            selected_enquiry_parts = set(
+                st.session_state.get("selected_enquiry_parts", [])
+            )
+            enquiry_part_col = first_existing_column(
+                drill_df,
+                ["PART NUMBER", "Part Number", "Subpart Part Num", "PART", "Part"],
+            )
+            if enquiry_part_col and selected_enquiry_parts:
+                drill_df = drill_df[
+                    drill_df[enquiry_part_col].map(normalize_part_number).isin(
+                        selected_enquiry_parts
+                    )
+                ].copy()
+            else:
+                drill_df = drill_df.iloc[0:0].copy()
+            drill_title = f"ENQUIRY RESULTS ({len(drill_df):,})"
+        else:
+            selected_delay_bucket = st.session_state.get("selected_delay_bucket", "")
+            if selected_delay_bucket:
+                bucket_col = first_existing_column(
+                    drill_df,
+                    ["CALC_PRODUCTION_DELAY_BUCKET", "Production Delay Bucket", "Part Delay Days Bucket"],
+                )
+                if bucket_col is not None:
+                    def _normalize_delay_bucket(value):
+                        value = str(value).strip().lower()
+                        for dash in ("–", "—", "−"):
+                            value = value.replace(dash, "-")
+                        return " ".join(value.split())
+
+                    selected_norm = _normalize_delay_bucket(selected_delay_bucket)
+                    drill_df = drill_df[
+                        drill_df[bucket_col].astype(str).map(_normalize_delay_bucket).eq(selected_norm)
+                    ].copy()
+                    # A delay bucket contains RED - PRODUCTION parts only.
+                    class_col = first_existing_column(
+                        drill_df, ["CALC_CLASSIFICATION", "CLASSIFICATION"]
+                    )
+                    if class_col is not None:
+                        drill_df = drill_df[
+                            drill_df[class_col].fillna("").astype(str).str.strip().str.upper()
+                            == "RED - PRODUCTION"
+                        ].copy()
+                drill_title = f"{selected_delay_bucket} ({len(drill_df):,})"
+            elif st.session_state.get("selected_hotspot", ""):
+                selected_hotspot = st.session_state["selected_hotspot"]
+                current_col = get_current_column(drill_df)
+                if current_col is not None:
+                    drill_df = drill_df[
+                        drill_df[current_col].fillna("").astype(str).str.strip().eq(selected_hotspot)
+                    ].copy()
+                drill_title = f"HOTSPOT: {selected_hotspot} ({len(drill_df):,})"
+            elif selected_classification == "ALL":
+                drill_title = f"ALL UNIQUE PARTS ({len(drill_df):,})"
+            else:
+                drill_title = f"{selected_classification} ({len(drill_df):,})"
 
     render_drilldown(
         drill_df,
@@ -6009,118 +7583,6 @@ def render_calculation_layer():
 
 
 # ============================================================
-# MANAGEMENT COMMITMENT
-# ============================================================
-
-def render_management_commitment():
-
-    render_title(
-        "MANAGEMENT COMMITMENT",
-        (
-            "Management action and "
-            "commitment queue."
-        ),
-    )
-
-    actions_df = (
-        st.session_state.actions_df
-    )
-
-    open_action = 0
-    overdue = 0
-    due_today = 0
-    upcoming = 0
-    no_commitment = 0
-
-    if (
-        actions_df is not None
-        and not actions_df.empty
-    ):
-
-        for _, action_row in (
-            actions_df.iterrows()
-        ):
-
-            status = (
-                calculate_commitment_status(
-                    action_row.get(
-                        "COMMITMENT_DATE"
-                    ),
-                    action_row.get(
-                        "ACTION_STATUS"
-                    ),
-                    control_date,
-                )
-            )
-
-            if status != "COMPLETED":
-                open_action += 1
-
-            if status == "OVERDUE":
-                overdue += 1
-
-            elif status == "DUE TODAY":
-                due_today += 1
-
-            elif status == "UPCOMING":
-                upcoming += 1
-
-            elif status == "NO COMMITMENT":
-                no_commitment += 1
-
-    cols = st.columns(5)
-
-    cols[0].metric(
-        "OPEN ACTION",
-        open_action,
-    )
-
-    cols[1].metric(
-        "OVERDUE",
-        overdue,
-    )
-
-    cols[2].metric(
-        "DUE TODAY",
-        due_today,
-    )
-
-    cols[3].metric(
-        "UPCOMING",
-        upcoming,
-    )
-
-    cols[4].metric(
-        "NO COMMITMENT",
-        no_commitment,
-    )
-
-    st.divider()
-
-    st.markdown(
-        "### COMMITMENT QUEUE"
-    )
-
-    if (
-        actions_df is None
-        or actions_df.empty
-    ):
-
-        st.info(
-            "No management commitments "
-            "recorded yet."
-        )
-
-    else:
-
-        st.dataframe(
-            actions_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# ============================================================
 # PERSISTENT UI CONTROLLER
 # ============================================================
 
@@ -6155,6 +7617,11 @@ elif module == "Calculation Layer":
 
     render_calculation_layer()
 
-elif module == "Management Commitment":
 
-    render_management_commitment()
+if st.session_state.get("show_enquiry_missing_dialog", False):
+    _render_enquiry_missing_dialog()
+
+
+# Preserve this browser's loaded BAQ, customer and UI filters across a temporary
+# Streamlit WebSocket/session reset while the app process remains available.
+_save_persistent_state()

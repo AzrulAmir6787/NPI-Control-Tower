@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import html
 import io
+import json
 import math
 import secrets as py_secrets
 import threading
@@ -5671,6 +5672,104 @@ def render_drilldown(df, title):
         df
     )
 
+    # ========================================================
+    # PART DETAIL POP-UP DATA HELPERS
+    # ========================================================
+
+    def detail_source_value(source_row, aliases, value_type="text"):
+        if source_row is None or not hasattr(source_row, "index"):
+            return ""
+        source_col = first_existing_column(source_row.to_frame().T, aliases)
+        if not source_col:
+            return ""
+        value = source_row.get(source_col, "")
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        if value_type == "date":
+            return safe_text(fmt_date(value))
+        if value_type == "number":
+            return safe_text(fmt_number(value))
+        return safe_text(value)
+
+    # Part Detail reads directly from the selected row in Unique Part Dataset.
+    # These are BAQ headers; keep the aliases broad for existing calculated columns.
+    detail_field_aliases = [
+        ("Part Number", ["Subpart Part Num", "PART NUMBER", "Part Number", "PART", "Part"], "text"),
+        ("PO Number", ["PO - POLine", "PO NUMBER", "PO Number"], "text"),
+        ("Engineer", ["Assigned Eng", "Assigned Engineer", "Engineer", "ENGINEER", "Engineer Name", "Engineering", "Engineering Owner"], "text"),
+        ("Job Number", ["JobNum/Asm", "Job Num/Asm", "JobNum", "JOB NO", "Job No", "Job Number", "Job"], "text"),
+        ("Nesting Number", ["Nesting Num", "Nesting Number", "Nesting No", "Nesting", "NestingNumber", "Nest Number"], "text"),
+        ("Order Date", ["Order Date", "ORDER DATE", "M Order Date"], "date"),
+        ("Exwork Date", ["Exwork Date", "Ex-Work Date", "Ex Work Date", "EXWORK DATE", "M Exwork Date", "Ex-Work", "Exwork"], "date"),
+        ("First Process Plan Date", ["First Process Plan Date"], "date"),
+        ("Delay Days", ["CALC_DELAY_DAYS", "TEST23C - Delay Days", "DELAY DAYS", "DELAY DAYS.1", "Delay Days"], "number"),
+        ("Aging", ["CALC_ORDER_AGE_DAYS", "CALC_STAGE_AGING_DAYS", "CALC_PRODUCTION_DELAY_AGE", "CALC_AGING_DAYS", "AGING DAYS", "AGING", "Aging"], "number"),
+        ("Material", ["Mtl 10", "Material", "MATERIAL", "Subpart Material", "Material Description"], "text"),
+        ("Qty", ["Subpart Qty", "SUBPART QTY", "Subpart Quantity", "QTY", "Qty"], "number"),
+        ("Finishing", ["Finishing", "FINISHING", "Subpart Finishing"], "text"),
+        ("Plating", ["Plating", "PLATING", "Subpart Plating"], "text"),
+        ("Subpart 2D Rev", ["Subpart 2D Rev", "Subpart 2D Revision", "2D Rev", "2D Revision"], "text"),
+        ("Subpart 3D Rev", ["Subpart 3D Rev", "Subpart 3D Revision", "3D Rev", "3D Revision"], "text"),
+        ("Subpart KK Rev", ["Subpart KK Rev", "Subpart KK Revision", "KK Rev", "KK Revision"], "text"),
+    ]
+
+    def build_part_detail_payload(source_row, part_key):
+        payload = {
+            label: detail_source_value(source_row, aliases, value_type)
+            for label, aliases, value_type in detail_field_aliases
+        }
+        picture = None
+        if part_key:
+            picture = picture_map.get(part_key)
+            if picture is None:
+                try:
+                    picture = get_picture_for_part(picture_map, part_key)
+                except Exception:
+                    picture = None
+        picture_data = ""
+        if picture is not None:
+            try:
+                if isinstance(picture, (bytes, bytearray, memoryview)):
+                    picture_bytes = bytes(picture)
+                elif hasattr(picture, "save"):
+                    picture_stream = BytesIO()
+                    picture.save(picture_stream, format="PNG")
+                    picture_bytes = picture_stream.getvalue()
+                else:
+                    picture_bytes = b""
+                picture_data = image_to_base64(picture_bytes) or ""
+            except Exception:
+                picture_data = ""
+        payload["Picture"] = ("data:image/png;base64," + picture_data) if picture_data else ""
+
+        # The clicked row already comes from the filtered Unique Part Dataset.
+        # Read Step 1..20 and each matching Job Oper date pair from this exact row;
+        # never re-query raw/calc data by Part Number, which could select another record.
+        payload["Process Routing"] = []
+        excluded_operations = {"COMPLETE", "COMPLETED", "N/A", "NA", "NONE", "-", "NAN"}
+        for step_no in range(1, 21):
+            operation = detail_source_value(source_row, [f"Step {step_no}"])
+            if not operation or operation.strip().upper() in excluded_operations:
+                continue
+            job_oper_no = step_no * 10
+            payload["Process Routing"].append({
+                "Operation": operation,
+                "Plan Start Date": detail_source_value(
+                    source_row,
+                    [f"Job Oper {job_oper_no} Plan Start Date"],
+                    "date",
+                ),
+                "Actual Start Date": detail_source_value(
+                    source_row,
+                    [f"Job Oper {job_oper_no} Actual Start Date"],
+                    "date",
+                ),
+            })
+        return payload
+
     # Prepare a single-line header. The Current Process popover must be created
     # before sorting/pagination so its selection can filter the data on this run.
     st.markdown(
@@ -5714,6 +5813,7 @@ def render_drilldown(df, title):
 
     current_process_filter_key = "drilldown_current_process_filter"
     process_options = ["ALL"]
+    process_option_labels = {"ALL": f"ALL{chr(160) * 7}{len(df):,}"}
     if current_col and current_col in df.columns:
         process_values = (
             df[current_col]
@@ -5721,11 +5821,17 @@ def render_drilldown(df, title):
             .astype(str)
             .str.strip()
         )
-        process_options.extend(
-            sorted(
-                value for value in process_values.unique().tolist()
-                if value and value.lower() not in {"nan", "none"}
-            )
+        process_values = process_values[
+            process_values.ne("") & ~process_values.str.lower().isin({"nan", "none"})
+        ]
+        process_counts = process_values.value_counts().to_dict()
+        ordered_processes = sorted(
+            process_counts,
+            key=lambda value: (-process_counts[value], value.casefold()),
+        )
+        process_options.extend(ordered_processes)
+        process_option_labels.update(
+            {value: f"{value}{chr(160) * 7}{process_counts[value]:,}" for value in ordered_processes}
         )
 
     if st.session_state.get(current_process_filter_key, "ALL") not in process_options:
@@ -5766,6 +5872,7 @@ def render_drilldown(df, title):
                 st.selectbox(
                     "Current Process",
                     process_options,
+                    format_func=lambda value: process_option_labels.get(value, value),
                     key=current_process_filter_key,
                     label_visibility="collapsed",
                     on_change=lambda: [
@@ -6398,31 +6505,54 @@ def render_drilldown(df, title):
     html_parts = []
 
     html_parts.append(
+        """
+        <style>
+            .npi-drilldown-wrap {
+                border: 1px solid #d8e0ea;
+                border-radius: 10px;
+                overflow: auto;
+                background: #ffffff;
+                box-shadow: 0 2px 8px rgba(15, 35, 60, 0.07);
+                scrollbar-color: #aebdce #f3f6fa;
+                scrollbar-width: thin;
+            }
+            .npi-drilldown-table {
+                border-collapse: separate;
+                border-spacing: 0;
+                table-layout: fixed;
+                width: max-content;
+                min-width: 100%;
+                font-family: Inter, Segoe UI, Arial, sans-serif;
+                font-size: 12px;
+                color: #233247;
+            }
+            .npi-drilldown-table tbody tr:hover td {
+                background: #eaf3ff !important;
+            }
+            .npi-drilldown-table tbody tr.npi-part-detail-clickable {
+                cursor: pointer;
+            }
+            .npi-drilldown-table tbody td {
+                transition: background-color 100ms ease-in-out;
+            }
+        </style>
+        """
+    )
+
+    html_parts.append(
         f"""
-        <div style="
+        <div class="npi-drilldown-wrap" style="
             width:100%;
-            overflow-x:auto;
-            overflow-y:auto;
             max-height:calc(100vh - 220px);
             min-height:553px;
-            border:1px solid #d0d0d0;
             position:relative;
-            background:#ffffff;
         ">
         """
     )
 
     html_parts.append(
         """
-        <table style="
-            border-collapse:separate;
-            border-spacing:0;
-            table-layout:fixed;
-            width:max-content;
-            min-width:100%;
-            font-family:Arial,sans-serif;
-            font-size:12px;
-        ">
+        <table class="npi-drilldown-table">
         """
     )
 
@@ -6526,9 +6656,9 @@ def render_drilldown(df, title):
                     max-width:{width}px;
                     height:{TOTAL_HEADER_HEIGHT}px;
                     padding:5px 5px;
-                    border-right:1px solid #bdbdbd;
-                    border-bottom:1px solid #bdbdbd;
-                    border-left:1px solid #bdbdbd;
+                    border-right:1px solid #d3deea;
+                    border-bottom:1px solid #d3deea;
+                    border-left:1px solid #d3deea;
                     text-align:center;
                     vertical-align:middle;
                     font-weight:700;
@@ -6540,7 +6670,8 @@ def render_drilldown(df, title):
                     position:sticky !important;
                     top:0px !important;
 
-                    background:#f2f2f2 !important;
+                    background:#20354f !important;
+                    color:#ffffff !important;
 
                     {sticky_style}
                 "
@@ -6567,9 +6698,9 @@ def render_drilldown(df, title):
                 min-width:{commitment_total_width}px;
                 height:{MAIN_HEADER_HEIGHT}px;
                 padding:5px 5px;
-                border-right:1px solid #bdbdbd;
-                border-bottom:1px solid #bdbdbd;
-                border-left:1px solid #bdbdbd;
+                border-right:1px solid #d3deea;
+                border-bottom:1px solid #d3deea;
+                border-left:1px solid #d3deea;
                 text-align:center;
                 vertical-align:middle;
                 font-weight:700;
@@ -6581,7 +6712,8 @@ def render_drilldown(df, title):
                 top:0px !important;
 
                 z-index:45;
-                background:#f2f2f2 !important;
+                background:#167d9a !important;
+                color:#ffffff !important;
             "
         >
             COMMITMENT
@@ -6621,9 +6753,9 @@ def render_drilldown(df, title):
                     max-width:{width}px;
                     height:{SUB_HEADER_HEIGHT}px;
                     padding:5px 5px;
-                    border-right:1px solid #bdbdbd;
-                    border-bottom:1px solid #bdbdbd;
-                    border-left:1px solid #bdbdbd;
+                    border-right:1px solid #d3deea;
+                    border-bottom:1px solid #d3deea;
+                    border-left:1px solid #d3deea;
                     text-align:center;
                     vertical-align:middle;
                     font-weight:700;
@@ -6636,7 +6768,8 @@ def render_drilldown(df, title):
                     top:{MAIN_HEADER_HEIGHT}px !important;
 
                     z-index:44;
-                    background:#f2f2f2 !important;
+                    background:#e8f1f8 !important;
+                    color:#20354f !important;
                 "
             >
                 {html_escape(heading)}
@@ -6660,7 +6793,9 @@ def render_drilldown(df, title):
         "<tbody>"
     )
 
-    for _, row in page_df.iterrows():
+    for row_index, (_, row) in enumerate(page_df.iterrows()):
+
+        row_background = "#ffffff" if row_index % 2 == 0 else "#f6f8fb"
 
         part_value = get_value(
             row,
@@ -6676,10 +6811,18 @@ def render_drilldown(df, title):
             {},
         )
 
+        part_detail_json = json.dumps(
+            build_part_detail_payload(row, part_key),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        part_detail_attribute = html.escape(part_detail_json, quote=True)
+
         html_parts.append(
             f"""
-            <tr style="
+            <tr class="npi-drilldown-row npi-part-detail-clickable" data-part-detail="{part_detail_attribute}" title="Click to open Part Detail" style="
                 height:{BODY_ROW_HEIGHT}px;
+                cursor:pointer;
             ">
             """
         )
@@ -6806,7 +6949,7 @@ def render_drilldown(df, title):
                     position:sticky;
                     left:{sticky_left[heading]}px;
                     z-index:8;
-                    background:#ffffff;
+                    background:{row_background};
                 """
 
             html_parts.append(
@@ -6823,9 +6966,10 @@ def render_drilldown(df, title):
                         max-width:{width}px;
                         height:{BODY_ROW_HEIGHT}px;
                         padding:5px 6px;
-                        border-right:1px solid #d0d0d0;
-                        border-bottom:1px solid #d0d0d0;
-                        border-left:1px solid #d0d0d0;
+                        border-right:1px solid #e0e6ee;
+                        border-bottom:1px solid #e0e6ee;
+                        border-left:1px solid #e0e6ee;
+                        background:{row_background};
                         vertical-align:middle;
                         text-align:center;
                         box-sizing:border-box;
@@ -6983,9 +7127,10 @@ def render_drilldown(df, title):
                         max-width:{width}px;
                         height:{BODY_ROW_HEIGHT}px;
                         padding:5px 6px;
-                        border-right:1px solid #d0d0d0;
-                        border-bottom:1px solid #d0d0d0;
-                        border-left:1px solid #d0d0d0;
+                        border-right:1px solid #e0e6ee;
+                        border-bottom:1px solid #e0e6ee;
+                        border-left:1px solid #e0e6ee;
+                        background:{row_background};
                         vertical-align:middle;
                         text-align:center;
                         box-sizing:border-box;
@@ -7013,6 +7158,64 @@ def render_drilldown(df, title):
 
     html_parts.append(
         "</div>"
+    )
+
+    html_parts.append(
+        """
+        <script>
+        (function () {
+            const root = document.querySelector('.npi-drilldown-wrap') || document;
+            const rows = root.querySelectorAll('tr.npi-part-detail-clickable');
+            rows.forEach((row) => {
+                row.addEventListener('click', function () {
+                    let detail;
+                    try { detail = JSON.parse(this.getAttribute('data-part-detail') || '{}'); }
+                    catch (e) { return; }
+                    const popup = window.open('', '_blank', 'width=1180,height=900,resizable=yes,scrollbars=yes');
+                    if (!popup) {
+                        alert('Part Detail pop-up was blocked by your browser. Please allow pop-ups for this app and click the row again.');
+                        return;
+                    }
+                    const esc = (value) => String(value == null || value === '' ? '—' : value)
+                        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+                    const field = (label, value, extra='') => `<div class="field ${extra}"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`;
+                    const routing = Array.isArray(detail['Process Routing']) ? detail['Process Routing'] : [];
+                    const parseDate = (value) => {
+                        const s = String(value == null ? '' : value).trim();
+                        if (!s || s === '—') return null;
+                        let m = s.match(/^(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2})/);
+                        if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+                        m = s.match(/^(\\d{1,2})[-/.](\\d{1,2})[-/.](\\d{4})/);
+                        if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+                        const d = new Date(s);
+                        return Number.isNaN(d.getTime()) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate());
+                    };
+                    const routingRows = routing.length ? routing.map((r, i) => {
+                        const plan = parseDate(r['Plan Start Date']);
+                        const actual = parseDate(r['Actual Start Date']);
+                        const late = !!(plan && actual && actual > plan);
+                        return `<tr><td class="step">${i + 1}</td><td>${esc(r['Operation'])}</td><td>${esc(r['Plan Start Date'])}</td><td class="${late ? 'actual-late' : ''}">${esc(r['Actual Start Date'])}</td></tr>`;
+                    }).join('') : '<tr><td colspan="4" class="empty">No process routing records available in the loaded data.</td></tr>';
+                    const picture = detail.Picture ? `<img class="part-picture" src="${detail.Picture}" alt="Part picture">` : '<div class="picture-placeholder">No picture available</div>';
+                    popup.document.open();
+                    popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Part Detail — ${esc(detail['Part Number'])}</title><style>
+                        *{box-sizing:border-box} html,body{height:100%;overflow:hidden} body{margin:0;background:#eef3f8;color:#1e293b;font-family:Inter,Segoe UI,Arial,sans-serif;padding:14px}
+                        .page{max-width:1600px;height:100%;margin:0 auto;display:flex;flex-direction:column;min-height:0}.top{display:flex;flex-shrink:0;justify-content:space-between;align-items:center;gap:20px;margin-bottom:12px;padding:12px 18px;background:linear-gradient(115deg,#172b46,#234b68);border-radius:16px;color:#fff;box-shadow:0 8px 24px rgba(22,43,70,.16)}
+                        .eyebrow{font-size:10px;font-weight:800;letter-spacing:1.6px;color:#79d4e4;text-transform:uppercase;margin-bottom:7px}.title{font-size:27px;font-weight:800;line-height:1.2;margin:0;overflow-wrap:anywhere;color:#fff}.subtitle{color:#d3e0ec;font-size:12px;margin-top:7px}
+                        .close{border:1px solid rgba(255,255,255,.3);background:rgba(255,255,255,.1);color:#fff;border-radius:9px;padding:9px 13px;font-weight:700;cursor:pointer;white-space:nowrap}.close:hover{background:rgba(255,255,255,.2)}.detail-layout{display:grid;grid-template-columns:minmax(390px,1.04fr) minmax(470px,1fr);gap:14px;align-items:stretch;flex:1;min-height:0}.right-column{display:flex;flex-direction:column;gap:10px;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}.left-column{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}.left-column>.card{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}.detail-layout>.card{margin-bottom:0;min-width:0}.picture-card,.card{background:#fff;border:1px solid #dfe7f0;border-radius:14px;box-shadow:0 5px 18px rgba(15,23,42,.045)}
+                        .picture-card{min-height:205px;padding:12px;display:grid;grid-template-columns:minmax(0,1fr) minmax(145px,.72fr);gap:12px;align-items:stretch;background:linear-gradient(145deg,#fff,#f5f9fc);overflow:hidden}.picture-stage{min-width:0;display:flex;align-items:center;justify-content:center;border-radius:10px;background:#fff;border:1px solid #edf1f6;padding:8px}.part-picture{display:block;max-width:100%;max-height:178px;object-fit:contain}.picture-placeholder{min-height:170px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px;text-align:center}.picture-stats{display:grid;grid-template-rows:1fr 1fr;gap:10px;min-width:0}.stat-tile{display:flex;flex-direction:column;justify-content:center;padding:12px 13px;border-radius:11px;background:linear-gradient(140deg,#20354f,#2c5873);color:#fff;min-width:0}.stat-tile.qty{background:linear-gradient(140deg,#087f9b,#10a4b7)}.stat-label{font-size:10px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;color:#d5e7ef;margin-bottom:8px}.stat-value{font-size:clamp(23px,2.5vw,34px);font-weight:850;line-height:1.05;overflow-wrap:anywhere;color:#fff}.process-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 0 13px}.process-stat{padding:10px 12px;border-radius:10px;border:1px solid #e0eaf1;background:#f5f9fc}.process-stat .label{margin-bottom:4px}.process-stat .value{font-size:18px;font-weight:800;color:#20354f}
+                        .card{padding:16px;margin-bottom:0}.section-title{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:800;color:#20354f;margin:0 0 13px}.section-title:before{content:'';width:4px;height:18px;border-radius:4px;background:#0e9ab3}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.field{padding:9px 10px;border:1px solid #e8eef5;border-radius:9px;background:#f8fafc;min-width:0}.label{font-size:9px;text-transform:uppercase;letter-spacing:.7px;color:#718096;font-weight:800;margin-bottom:5px}.value{font-size:12px;font-weight:650;color:#26364a;overflow-wrap:anywhere;min-height:15px}.process-card{padding:13px;position:relative;display:flex;flex-direction:column;flex:1;min-height:0}.process-meta{font-size:10px;color:#718096;margin:-5px 0 8px}.routing-wrap{flex:1;max-height:none;min-height:100px;overflow:auto;border:1px solid #e1e8f0;border-radius:10px;scrollbar-width:thin;scrollbar-color:#c2cedb #f4f7fa}.routing{width:100%;border-collapse:separate;border-spacing:0;font-size:11px;overflow:hidden}.routing th{position:sticky;top:0;z-index:2;background:#20354f;color:#fff;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.55px;padding:11px 10px;white-space:normal}.routing td{padding:9px 10px;border-top:1px solid #e8edf3;background:#fff;vertical-align:top}.routing tr:nth-child(even) td{background:#f7f9fc}.routing tbody tr:hover td{background:#eaf6fa}.routing .step{width:38px;color:#0e8aa3;font-weight:800;text-align:center}.routing td.actual-late{background:#fee2e2!important;color:#b91c1c;font-weight:800;box-shadow:inset 3px 0 0 #dc2626}.empty{text-align:center;color:#94a3b8;padding:24px!important}.footer{font-size:10px;color:#8190a3;text-align:right;margin-top:10px}@media(max-width:980px){body{padding:10px}.detail-layout{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}.process-card{position:relative}.routing-wrap{max-height:none;min-height:80px}.top{padding:10px 13px;margin-bottom:9px}.title{font-size:22px}.card{padding:12px}}@media(max-width:650px){.detail-layout{grid-template-columns:1fr 1fr;gap:8px}.picture-card{grid-template-columns:1fr}.picture-stage{min-height:100px}.picture-stats{grid-template-columns:1fr;grid-template-rows:auto}.stat-value{font-size:20px}.grid{grid-template-columns:1fr}.process-stats{grid-template-columns:1fr}.action-form{grid-template-columns:1fr}.action-form .remark-field{grid-column:auto}.routing th,.routing td{padding:6px 5px;font-size:9px}.section-title{font-size:12px}.card,.process-card{padding:9px}}
+                        @media(max-width:520px){.picture-card{grid-template-columns:1fr}.picture-stage{min-height:150px}.picture-stats{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:auto}.stat-value{font-size:25px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.card,.process-card{padding:12px}.routing th,.routing td{padding:8px 7px}}
+                    </style></head><body><main class="page"><header class="top"><div><div class="eyebrow">NPI Control Tower · Part Profile</div><h1 class="title">${esc(detail['Part Number'])}</h1><div class="subtitle">Purchase Order: ${esc(detail['PO Number'])} &nbsp;·&nbsp; Job: ${esc(detail['Job Number'])}</div></div><button class="close" onclick="window.close()">✕ Close</button></header>
+                    <section class="detail-layout"><div class="left-column"><div class="picture-card"><div class="picture-stage">${picture}</div><div class="picture-stats"><div class="stat-tile qty"><div class="stat-label">Qty</div><div class="stat-value">${esc(detail.Qty)}</div></div><div class="stat-tile"><div class="stat-label">Engineer</div><div class="stat-value" style="font-size:clamp(17px,1.8vw,25px)">${esc(detail.Engineer)}</div></div></div></div><section class="card"><h2 class="section-title">Part Informations</h2><div class="grid">${field('PO Number',detail['PO Number'])}${field('Order Date',detail['Order Date'])}${field('Exwork Date',detail['Exwork Date'])}${field('Job Number',detail['Job Number'])}${field('Nesting Number',detail['Nesting Number'] === '' || detail['Nesting Number'] == null ? '' : (Number.isFinite(Number(detail['Nesting Number'])) ? String(Math.trunc(Number(detail['Nesting Number']))) : detail['Nesting Number']))}${field('Material',detail.Material)}${field('Plating',detail.Plating)}${field('Finishing',detail.Finishing)}${field('Subpart 2D Rev',detail['Subpart 2D Rev'])}${field('Subpart 3D Rev',detail['Subpart 3D Rev'])}${field('Subpart KK Rev',detail['Subpart KK Rev'])}</div></section></div>
+                    <div class="right-column"><section class="card process-card"><h2 class="section-title">Process</h2><div class="process-meta">${routing.length} process step(s) · Scroll within this panel to view all steps</div><div class="process-stats"><div class="process-stat"><div class="label">Delay Days</div><div class="value">${esc(detail['Delay Days'])}</div></div><div class="process-stat"><div class="label">Aging</div><div class="value">${esc(detail.Aging)}</div></div><div class="process-stat"><div class="label">First Process Plan Date</div><div class="value">${esc(detail['First Process Plan Date'])}</div></div></div><div class="routing-wrap"><table class="routing"><thead><tr><th style="width:42px">Step</th><th style="width:31%">Operation</th><th>Plan Start Date</th><th>Actual Start Date</th></tr></thead><tbody>${routingRows}</tbody></table></div><div class="footer">Actual Start Date turns red when it is later than Plan Start Date</div></section><section class="card action-card"><h2 class="section-title">Commitment & Remarks</h2><div class="action-form"><label>Owner<input type="text" id="detail-owner" placeholder="Enter owner"></label><label>Commitment Date<input type="date" id="detail-commitment-date"></label><label class="remark-field">Remark<textarea id="detail-remark" rows="3" placeholder="Enter remark"></textarea></label></div><div class="action-note">Enter the owner, target commitment date and remark for this part.</div></section></div></section></main><style>.action-card{margin-top:0;flex-shrink:0}.action-form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.action-form label{display:flex;flex-direction:column;gap:6px;font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:#718096}.action-form input,.action-form textarea{width:100%;font:500 12px Inter,Segoe UI,Arial,sans-serif;color:#26364a;background:#f8fafc;border:1px solid #dbe5ef;border-radius:9px;padding:10px;outline:none}.action-form input:focus,.action-form textarea:focus{border-color:#0e9ab3;box-shadow:0 0 0 3px rgba(14,154,179,.12)}.action-form .remark-field{grid-column:1/-1}.action-form textarea{resize:vertical;min-height:72px}.action-note{margin-top:9px;font-size:10px;color:#8190a3}@media(max-width:520px){.process-stats{grid-template-columns:1fr}.action-form{grid-template-columns:1fr}}</style></body></html>`);
+                    popup.document.close();
+                });
+            });
+        })();
+        </script>
+        """
     )
 
     components.html(

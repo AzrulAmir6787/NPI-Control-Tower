@@ -1,0 +1,39 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden}#content{width:100%;height:760px;border:0;display:block}</style></head>
+<body><iframe id="content" title="NPI Drilldown"></iframe>
+<script>
+(function(){
+  const frame=document.getElementById('content');
+  let lastHtml='';
+  function send(type, extra){ window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*'); }
+  function forwardCommitment(data){
+    if(data && data.type==='npi_commitment_save' && data.payload && typeof data.payload==='object'){
+      send('streamlit:setComponentValue',{value:data,dataType:'json'});
+    }
+  }
+  function render(event){
+    const d=event.data||{}; const args=d.args||{};
+    if(d.type!=='streamlit:render') return;
+    // Do not reload the inner table when HTML is unchanged. This keeps its scroll
+    // position and all in-progress inputs intact after a successful batch save.
+    if(typeof args.html_content==='string' && args.html_content!==lastHtml){
+      lastHtml=args.html_content;
+      frame.srcdoc=lastHtml;
+    }
+    const h=Number(args.height)||760;
+    frame.style.height=h+'px';
+    send('streamlit:setFrameHeight',{height:h});
+  }
+  window.addEventListener('message',function(event){
+    const d=event.data||{};
+    if(d.type==='streamlit:render'){render(event);return;}
+    if(d.type==='npi_commitment_save') forwardCommitment(d);
+  });
+  if('BroadcastChannel' in window){
+    try { const channel=new BroadcastChannel('npi_commitment_channel'); channel.addEventListener('message',function(event){forwardCommitment(event.data||{});}); } catch(e) {}
+  }
+  send('streamlit:componentReady',{apiVersion:1});
+  send('streamlit:setFrameHeight',{height:760});
+})();
+</script></body></html>

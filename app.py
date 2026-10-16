@@ -5,6 +5,7 @@ import html
 import io
 import json
 import math
+import os
 import secrets as py_secrets
 import threading
 import time
@@ -33,6 +34,16 @@ from actions import (
     calculate_commitment_status,
 )
 
+from commitment_store_secure import (
+    get_commitments as get_supabase_commitments,
+    save_commitment_patch as save_supabase_commitment_patch,
+)
+
+_npi_drilldown_component = components.declare_component(
+    "npi_drilldown_commitment_bridge",
+    path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "npi_drilldown_component"),
+)
+
 
 # ============================================================
 # PAGE CONFIG
@@ -47,29 +58,68 @@ st.set_page_config(
 
 
 # ============================================================
-# LOGIN / PERSISTENT SESSION ACCESS GATE
+# SUPABASE AUTH / PERSISTENT SESSION ACCESS GATE
 # ============================================================
 
-try:
-    LOGIN_USERNAME = str(
-        st.secrets["npi_login"]["username"]
-    )
-    LOGIN_PASSWORD = str(
-        st.secrets["npi_login"]["password"]
-    )
+from supabase import create_client
 
-except (FileNotFoundError, KeyError):
+
+def _secret_value(config, *names):
+    for name in names:
+        value = config.get(name)
+        if value:
+            return str(value)
+    return ""
+
+
+try:
+    _supabase_config = st.secrets["supabase"]
+    SUPABASE_URL = _secret_value(_supabase_config, "url", "SUPABASE_URL")
+    SUPABASE_PUBLISHABLE_KEY = _secret_value(
+        _supabase_config, "publishable_key", "anon_key", "SUPABASE_PUBLISHABLE_KEY"
+    )
+    SUPABASE_SECRET_KEY = _secret_value(
+        _supabase_config, "secret_key", "service_role_key", "service_key", "SUPABASE_SECRET_KEY"
+    )
+except (FileNotFoundError, KeyError, TypeError):
+    SUPABASE_URL = ""
+    SUPABASE_PUBLISHABLE_KEY = ""
+    SUPABASE_SECRET_KEY = ""
+
+if not (SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY):
     st.error(
-        "Login credentials are not configured. "
-        "Please contact the app owner."
+        "Supabase configuration is incomplete. Please check the [supabase] section "
+        "in .streamlit/secrets.toml. Required values: url, publishable_key, secret_key."
     )
     st.stop()
 
 
-# Streamlit Session State is tied to its WebSocket connection. A reconnect or
-# browser reload can create a new session and clear that state. Use a signed,
-# random browser cookie for login continuity, and a server-side per-cookie cache
-# for the uploaded BAQ and that browser's filters while the app process is alive.
+def _new_auth_client():
+    # Use the publishable key for user sign-up/sign-in. Do not share this client
+    # between users because its Auth session is mutable.
+    return create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+
+
+def _new_admin_client():
+    # Server-side only. The secret key must never be sent to the browser.
+    return create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+
+
+def _get_user_access(user_id):
+    response = (
+        _new_admin_client()
+        .table("user_access")
+        .select("user_id, full_name, status, role")
+        .eq("user_id", str(user_id))
+        .maybe_single()
+        .execute()
+    )
+    return response.data
+
+
+# Streamlit Session State is tied to its WebSocket connection. Keep the existing
+# per-browser state preservation, but the browser cookie is now only an opaque,
+# signed session ID. Supabase tokens and dashboard state stay server-side.
 SESSION_COOKIE_NAME = "npi_control_tower_session"
 SESSION_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days, or until explicit logout
 PERSISTED_STATE_KEYS = {
@@ -104,24 +154,18 @@ PERSISTED_STATE_KEYS = {
 @st.cache_resource
 def _get_persistent_session_store():
     """Shared in-memory cache, keyed by an unguessable per-browser token."""
-    return {
-        "sessions": {},
-        "revoked": {},
-        "lock": threading.RLock(),
-    }
+    return {"sessions": {}, "revoked": {}, "lock": threading.RLock()}
 
 
 _persistent_store = _get_persistent_session_store()
 
 
-def _make_session_cookie():
+def _make_session_cookie(user_id):
     issued_at = str(int(time.time()))
     nonce = py_secrets.token_urlsafe(32)
-    payload = f"npi-control-tower-v1|{LOGIN_USERNAME}|{issued_at}|{nonce}"
+    payload = f"npi-control-tower-v2|{user_id}|{issued_at}|{nonce}"
     signature = hmac.new(
-        LOGIN_PASSWORD.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
+        SUPABASE_SECRET_KEY.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
     ).hexdigest()
     return f"{issued_at}.{nonce}.{signature}"
 
@@ -129,7 +173,6 @@ def _make_session_cookie():
 def _verify_session_cookie(token):
     if not isinstance(token, str) or not token:
         return False
-
     try:
         issued_at_text, nonce, supplied_signature = token.split(".", 2)
         issued_at = int(issued_at_text)
@@ -141,59 +184,43 @@ def _verify_session_cookie(token):
     if age < -60 or age > SESSION_TTL_SECONDS:
         return False
 
-    payload = f"npi-control-tower-v1|{LOGIN_USERNAME}|{issued_at_text}|{nonce}"
-    expected_signature = hmac.new(
-        LOGIN_PASSWORD.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(supplied_signature, expected_signature):
-        return False
-
     with _persistent_store["lock"]:
         for old_token, expires_at in list(_persistent_store["revoked"].items()):
             if expires_at <= now:
                 _persistent_store["revoked"].pop(old_token, None)
         if _persistent_store["revoked"].get(token, 0) > now:
             return False
+        record = _persistent_store["sessions"].get(token)
+        # A signed cookie alone is not enough: its server-side login record must exist.
+        if not record or not record.get("user_id"):
+            return False
+        user_id = record["user_id"]
 
-    return True
+    payload = f"npi-control-tower-v2|{user_id}|{issued_at_text}|{nonce}"
+    expected_signature = hmac.new(
+        SUPABASE_SECRET_KEY.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(supplied_signature, expected_signature)
 
 
 def _get_or_create_session_record(token):
-    issued_at = int(token.split(".", 1)[0])
-    expires_at = issued_at + SESSION_TTL_SECONDS
     now = time.time()
-
     with _persistent_store["lock"]:
         for old_token, record in list(_persistent_store["sessions"].items()):
             if record.get("expires_at", 0) <= now:
                 _persistent_store["sessions"].pop(old_token, None)
-
         record = _persistent_store["sessions"].get(token)
-        created = record is None
-        if created:
-            record = {
-                "expires_at": expires_at,
-                "state": {},
-            }
-            _persistent_store["sessions"][token] = record
-
-        return record, created
+        return record, record is None
 
 
 def _capture_persistent_state():
     state = {}
     for key in PERSISTED_STATE_KEYS:
         if key in st.session_state:
-            # These values are maintained per browser token. App code generally
-            # replaces DataFrames rather than mutating them in place.
             state[key] = st.session_state[key]
-
     for key in list(st.session_state.keys()):
         if str(key).startswith("drilldown_page_state_"):
             state[key] = st.session_state[key]
-
     return state
 
 
@@ -201,7 +228,6 @@ def _save_persistent_state():
     token = st.session_state.get("_npi_session_token")
     if not token or not st.session_state.get("npi_authenticated", False):
         return
-
     with _persistent_store["lock"]:
         record = _persistent_store["sessions"].get(token)
         if record is not None:
@@ -215,8 +241,6 @@ def _restore_persistent_state(record):
             st.session_state[key] = value
 
 
-# The component reads/writes a browser cookie. The cookie contains only a signed
-# session token, never the username or password itself.
 cookie_manager = stx.CookieManager(key="npi_control_tower_cookie_manager")
 try:
     browser_cookies = cookie_manager.get_all()
@@ -232,20 +256,30 @@ session_token = (
 
 if _verify_session_cookie(session_token):
     session_record, session_record_created = _get_or_create_session_record(session_token)
-    st.session_state["_npi_session_token"] = session_token
-    st.session_state["npi_authenticated"] = True
-
-    if not st.session_state.get("_npi_persistent_state_loaded", False):
-        _restore_persistent_state(session_record)
-        st.session_state["_npi_persistent_state_loaded"] = True
-        if session_record_created:
-            # The signed login cookie survived, but the app worker's in-memory
-            # BAQ cache did not (for example, after a server process restart).
-            st.session_state["_npi_state_recovery_notice"] = True
+    if session_record is not None:
+        st.session_state["_npi_session_token"] = session_token
+        st.session_state["npi_authenticated"] = True
+        st.session_state["npi_user_id"] = session_record.get("user_id")
+        st.session_state["npi_user_full_name"] = session_record.get("full_name", "")
+        st.session_state["npi_user_role"] = session_record.get("role", "USER")
+        if not st.session_state.get("_npi_persistent_state_loaded", False):
+            _restore_persistent_state(session_record)
+            st.session_state["_npi_persistent_state_loaded"] = True
+            if session_record_created:
+                st.session_state["_npi_state_recovery_notice"] = True
 else:
     st.session_state["npi_authenticated"] = False
     st.session_state.pop("_npi_session_token", None)
     st.session_state.pop("_npi_persistent_state_loaded", None)
+
+
+def _delete_login_cookie():
+    try:
+        cookie_manager.delete(
+            SESSION_COOKIE_NAME, key="delete_npi_control_tower_session"
+        )
+    except Exception:
+        pass
 
 
 def _logout_current_session():
@@ -256,92 +290,212 @@ def _logout_current_session():
             token_expiry = issued_at + SESSION_TTL_SECONDS
         except (TypeError, ValueError):
             token_expiry = time.time() + SESSION_TTL_SECONDS
-
         with _persistent_store["lock"]:
-            _persistent_store["sessions"].pop(token, None)
+            record = _persistent_store["sessions"].pop(token, None)
             _persistent_store["revoked"][token] = token_expiry
+        if record and record.get("access_token") and record.get("refresh_token"):
+            try:
+                auth_client = _new_auth_client()
+                auth_client.auth.set_session(
+                    record["access_token"], record["refresh_token"]
+                )
+                auth_client.auth.sign_out()
+            except Exception:
+                pass
 
-    try:
-        cookie_manager.delete(SESSION_COOKIE_NAME, key="delete_npi_control_tower_session")
-    except Exception:
-        pass
-
-    # Remove this browser's in-memory BAQ and UI state on explicit logout.
+    _delete_login_cookie()
     for key in list(st.session_state.keys()):
         if (
             key in PERSISTED_STATE_KEYS
             or str(key).startswith("drilldown_page_state_")
-            or key in {"baq_upload", "_npi_session_token", "_npi_persistent_state_loaded", "_npi_state_recovery_notice"}
+            or key in {
+                "baq_upload", "_npi_session_token", "_npi_persistent_state_loaded",
+                "_npi_state_recovery_notice", "npi_user_id", "npi_user_full_name",
+                "npi_user_role",
+            }
         ):
             try:
                 del st.session_state[key]
             except Exception:
                 pass
-
     st.session_state["npi_authenticated"] = False
     st.rerun()
 
 
+# Check authorization on the server on every app rerun, not only when logging in.
+_access_notice = st.session_state.pop("_npi_access_notice", None)
+if st.session_state.get("npi_authenticated", False):
+    try:
+        _current_access = _get_user_access(st.session_state.get("npi_user_id"))
+    except Exception:
+        st.error("Unable to verify your account access. Please refresh or try again later.")
+        st.stop()
+
+    if not _current_access or _current_access.get("status") != "APPROVED":
+        _status = (_current_access or {}).get("status", "NO PROFILE")
+        token = st.session_state.get("_npi_session_token")
+        if token:
+            with _persistent_store["lock"]:
+                _persistent_store["sessions"].pop(token, None)
+        _delete_login_cookie()
+        st.session_state["npi_authenticated"] = False
+        st.session_state.pop("_npi_session_token", None)
+        st.session_state.pop("_npi_persistent_state_loaded", None)
+        st.session_state.pop("npi_user_id", None)
+        st.session_state.pop("npi_user_full_name", None)
+        st.session_state.pop("npi_user_role", None)
+        _access_notice = (
+            "Your account is pending Admin approval."
+            if _status == "PENDING"
+            else "Your account does not currently have dashboard access. Please contact the Admin."
+        )
+    else:
+        st.session_state["npi_user_full_name"] = _current_access.get("full_name", "")
+        st.session_state["npi_user_role"] = _current_access.get("role", "USER")
+
+
 if not st.session_state.get("npi_authenticated", False):
     st.title("NPI Control Tower")
-    st.caption("Please sign in to continue.")
+    st.caption("Sign in with your individual account, or create an account for Admin approval.")
+    if _access_notice:
+        st.warning(_access_notice)
 
-    with st.form("npi_login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Log in")
+    auth_mode = st.radio(
+        "Account",
+        ["Log in", "Sign up"],
+        horizontal=True,
+        key="npi_auth_mode",
+    )
 
-    if submitted:
-        username_valid = hmac.compare_digest(
-            username.encode("utf-8"), LOGIN_USERNAME.encode("utf-8")
-        )
-        password_valid = hmac.compare_digest(
-            password.encode("utf-8"), LOGIN_PASSWORD.encode("utf-8")
-        )
+    if auth_mode == "Sign up":
+        with st.form("npi_signup_form"):
+            full_name = st.text_input("Full Name")
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            signup_submitted = st.form_submit_button("Create account")
 
-        if username_valid and password_valid:
-            new_token = _make_session_cookie()
-            expiry = int(new_token.split(".", 1)[0]) + SESSION_TTL_SECONDS
-            with _persistent_store["lock"]:
-                _persistent_store["sessions"][new_token] = {
-                    "expires_at": expiry,
-                    "state": {},
-                }
-
-            try:
-                # Secure cookies on hosted HTTPS; allow plain HTTP localhost for testing.
+        if signup_submitted:
+            full_name = full_name.strip()
+            email = email.strip()
+            if not full_name or not email or not password or not confirm_password:
+                st.error("Please complete all fields.")
+            elif password != confirm_password:
+                st.error("Password and Confirm Password do not match.")
+            else:
                 try:
-                    request_host = str(st.context.headers.get("Host", "")).lower()
-                except Exception:
-                    request_host = ""
-                secure_cookie = not (
-                    request_host.startswith("localhost")
-                    or request_host.startswith("127.0.0.1")
-                )
-                cookie_manager.set(
-                    cookie=SESSION_COOKIE_NAME,
-                    val=new_token,
-                    key="set_npi_control_tower_session",
-                    max_age=SESSION_TTL_SECONDS,
-                    path="/",
-                    secure=secure_cookie,
-                    same_site="lax",
-                )
-            except Exception:
-                st.error("Unable to create a persistent login cookie. Please refresh and try again.")
-                st.stop()
+                    signup_client = _new_auth_client()
+                    signup_response = signup_client.auth.sign_up(
+                        {
+                            "email": email,
+                            "password": password,
+                            "options": {"data": {"full_name": full_name}},
+                        }
+                    )
+                    signup_user = getattr(signup_response, "user", None)
+                    if signup_user is None:
+                        st.error("Sign-up did not return a user account. Please check the details and try again.")
+                    else:
+                        signup_access = _get_user_access(signup_user.id)
+                        if signup_access and signup_access.get("status") == "PENDING":
+                            st.success("Account created. Your status is PENDING; an Admin must approve it before you can access the dashboard.")
+                        elif signup_access:
+                            st.success("Account created. Please use Log in to continue once your access is approved.")
+                        else:
+                            st.error("The Auth account was created, but its user_access profile was not found. Please contact the Admin before trying again.")
+                except Exception as exc:
+                    message = str(exc)
+                    if "already registered" in message.lower() or "already exists" in message.lower():
+                        st.error("An account with this email may already exist. Try Log in or contact the Admin.")
+                    else:
+                        st.error(f"Sign-up failed: {message}")
 
-            st.session_state["_npi_session_token"] = new_token
-            st.session_state["npi_authenticated"] = True
-            st.session_state["_npi_persistent_state_loaded"] = False
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
+    else:
+        with st.form("npi_login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            login_submitted = st.form_submit_button("Log in")
+
+        if login_submitted:
+            if not email.strip() or not password:
+                st.error("Please enter your email and password.")
+            else:
+                try:
+                    auth_client = _new_auth_client()
+                    auth_response = auth_client.auth.sign_in_with_password(
+                        {"email": email.strip(), "password": password}
+                    )
+                    auth_user = getattr(auth_response, "user", None)
+                    auth_session = getattr(auth_response, "session", None)
+                    if auth_user is None or auth_session is None:
+                        st.error("Login did not return a valid session. Please try again.")
+                    else:
+                        user_access = _get_user_access(auth_user.id)
+                        if not user_access:
+                            st.error("Your account profile was not found. Please contact the Admin.")
+                        elif user_access.get("status") == "PENDING":
+                            st.warning("Your account is pending Admin approval. You can log in after it is approved.")
+                        elif user_access.get("status") == "SUSPENDED":
+                            st.error("Your account is suspended. Please contact the Admin.")
+                        elif user_access.get("status") != "APPROVED":
+                            st.error("Your account does not currently have dashboard access. Please contact the Admin.")
+                        else:
+                            new_token = _make_session_cookie(auth_user.id)
+                            expiry = int(new_token.split(".", 1)[0]) + SESSION_TTL_SECONDS
+                            with _persistent_store["lock"]:
+                                _persistent_store["sessions"][new_token] = {
+                                    "expires_at": expiry,
+                                    "state": {},
+                                    "user_id": str(auth_user.id),
+                                    "access_token": auth_session.access_token,
+                                    "refresh_token": auth_session.refresh_token,
+                                    "full_name": user_access.get("full_name", ""),
+                                    "role": user_access.get("role", "USER"),
+                                }
+
+                            try:
+                                try:
+                                    request_host = str(st.context.headers.get("Host", "")).lower()
+                                except Exception:
+                                    request_host = ""
+                                secure_cookie = not (
+                                    request_host.startswith("localhost")
+                                    or request_host.startswith("127.0.0.1")
+                                )
+                                cookie_manager.set(
+                                    cookie=SESSION_COOKIE_NAME,
+                                    val=new_token,
+                                    key="set_npi_control_tower_session",
+                                    max_age=SESSION_TTL_SECONDS,
+                                    path="/",
+                                    secure=secure_cookie,
+                                    same_site="lax",
+                                )
+                            except Exception:
+                                with _persistent_store["lock"]:
+                                    _persistent_store["sessions"].pop(new_token, None)
+                                st.error("Unable to create a persistent login cookie. Please refresh and try again.")
+                                st.stop()
+
+                            st.session_state["_npi_session_token"] = new_token
+                            st.session_state["npi_authenticated"] = True
+                            st.session_state["npi_user_id"] = str(auth_user.id)
+                            st.session_state["npi_user_full_name"] = user_access.get("full_name", "")
+                            st.session_state["npi_user_role"] = user_access.get("role", "USER")
+                            st.session_state["_npi_persistent_state_loaded"] = False
+                            st.rerun()
+                except Exception as exc:
+                    message = str(exc).lower()
+                    if "invalid login credentials" in message or "invalid credentials" in message:
+                        st.error("Invalid email or password.")
+                    else:
+                        st.error("Unable to log in. Please check your details or try again later.")
 
     st.stop()
 
 
 with st.sidebar:
+    st.caption(f"Signed in: {st.session_state.get('npi_user_full_name', '')}")
     if st.button("Log out", key="npi_logout_button", use_container_width=True):
         _logout_current_session()
 
@@ -6018,7 +6172,33 @@ def render_drilldown(df, title):
     ].copy()
 
     # ========================================================
-    # ACTION LOOKUP
+    # SHARED SUPABASE COMMITMENTS
+    # ========================================================
+
+    commitment_lookup = {}
+    current_user_id = safe_text(st.session_state.get("npi_user_id")).strip()
+    if current_user_id:
+        part_keys_for_commitments = []
+        if part_col and part_col in display_df.columns:
+            part_keys_for_commitments = [
+                safe_text(value).strip()
+                for value in display_df[part_col].tolist()
+                if safe_text(value).strip()
+            ]
+        try:
+            commitment_lookup = get_supabase_commitments(
+                part_keys_for_commitments, user_id=current_user_id
+            )
+        except Exception as commitment_error:
+            st.warning(
+                "Unable to load shared Supabase commitment records. "
+                f"The dashboard is still available, but commitment fields may be blank. ({commitment_error})"
+            )
+            commitment_lookup = {}
+
+    # Save one batch event from the drilldown or a single Part Detail popup.
+    # ========================================================
+    # ACTION LOOKUP (legacy BAQ/action data remains fallback only)
     # ========================================================
 
     actions_lookup = {}
@@ -6539,6 +6719,17 @@ def render_drilldown(df, title):
         """
     )
 
+    # Keep the save toolbar outside the horizontal-scroll container so it stays
+    # visible while the user scrolls across to the commitment columns.
+    html_parts.append(
+        """
+        <div class="npi-commitment-toolbar" style="position:sticky;top:0;z-index:1000;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 12px;background:#f7fafc;border:1px solid #d8e0ea;border-bottom:0;border-radius:10px 10px 0 0;">
+            <span id="npi-commitment-save-status" role="status" style="flex:1;min-width:0;font:600 11px Inter,Segoe UI,Arial,sans-serif;color:#526477;">Edit any number of parts, then save all changes once.</span>
+            <button type="button" id="npi-save-commitment" disabled style="flex:0 0 auto;margin-left:auto;border:0;border-radius:7px;background:#087f8c;color:#fff;padding:8px 14px;font:700 12px Inter,Segoe UI,Arial,sans-serif;cursor:pointer;opacity:.55;">Save Commitment</button>
+        </div>
+        """
+    )
+
     html_parts.append(
         f"""
         <div class="npi-drilldown-wrap" style="
@@ -6546,6 +6737,8 @@ def render_drilldown(df, title):
             max-height:calc(100vh - 220px);
             min-height:553px;
             position:relative;
+            border-top-left-radius:0;
+            border-top-right-radius:0;
         ">
         """
     )
@@ -6793,6 +6986,17 @@ def render_drilldown(df, title):
         "<tbody>"
     )
 
+    def commitment_date_input_value(value):
+        if value is None or value == "":
+            return ""
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed):
+                return ""
+            return parsed.strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
     for row_index, (_, row) in enumerate(page_df.iterrows()):
 
         row_background = "#ffffff" if row_index % 2 == 0 else "#f6f8fb"
@@ -6811,8 +7015,15 @@ def render_drilldown(df, title):
             {},
         )
 
+        part_detail_payload = build_part_detail_payload(row, part_key)
+        stored_commitment = commitment_lookup.get(part_key, {}) or {}
+        part_detail_payload["Commitment Part Key"] = part_key
+        part_detail_payload["Commitment Owner"] = safe_text(stored_commitment.get("owner", ""))
+        part_detail_payload["Commitment Date"] = safe_text(stored_commitment.get("commitment_date", ""))
+        part_detail_payload["Completion Date"] = safe_text(stored_commitment.get("completion_date", ""))
+        part_detail_payload["Commitment Remark"] = safe_text(stored_commitment.get("remarks", ""))
         part_detail_json = json.dumps(
-            build_part_detail_payload(row, part_key),
+            part_detail_payload,
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -6820,9 +7031,9 @@ def render_drilldown(df, title):
 
         html_parts.append(
             f"""
-            <tr class="npi-drilldown-row npi-part-detail-clickable" data-part-detail="{part_detail_attribute}" title="Click to open Part Detail" style="
+            <tr class="npi-drilldown-row npi-part-detail-clickable" data-part-key="{html.escape(part_key, quote=True)}" data-part-detail="{part_detail_attribute}" title="Single-click to select/edit commitment fields; click Save Commitment to save; double-click to open Part Detail" style="
                 height:{BODY_ROW_HEIGHT}px;
-                cursor:pointer;
+                cursor:default;
             ">
             """
         )
@@ -6997,120 +7208,37 @@ def render_drilldown(df, title):
                 100,
             )
 
-            action_value = ""
-
+            stored_commitment = commitment_lookup.get(part_key, {}) or {}
             if key == "owner":
-
-                action_value = (
-                    get_action_value(
-                        action,
-                        [
-                            "OWNER",
-                            "Owner",
-                        ],
-                    )
-                )
-
-            elif key == "action":
-
-                action_value = (
-                    get_action_value(
-                        action,
-                        [
-                            "ACTION",
-                            "Action",
-                        ],
-                    )
-                )
-
-            elif key == "support_required":
-
-                action_value = (
-                    get_action_value(
-                        action,
-                        [
-                            "SUPPORT_REQUIRED",
-                            "Support Required",
-                            "SUPPORT",
-                            "Support",
-                        ],
-                    )
-                )
-
+                field_name = "owner"
+                action_value = stored_commitment.get("owner") or ""
+                input_type = "text"
             elif key == "commitment_date":
-
-                action_value = (
-                    get_action_value(
-                        action,
-                        [
-                            "COMMITMENT_DATE",
-                            "Commitment Date",
-                        ],
-                    )
-                )
-
-                if action_value:
-
-                    action_value = (
-                        fmt_date(
-                            action_value
-                        )
-                    )
-
-            elif key == "action_status":
-
-                action_value = (
-                    get_action_value(
-                        action,
-                        [
-                            "ACTION_STATUS",
-                            "Action Status",
-                            "STATUS",
-                            "Commitment Status",
-                        ],
-                    )
-                )
-
+                field_name = "commitment_date"
+                action_value = commitment_date_input_value(stored_commitment.get("commitment_date"))
+                input_type = "date"
             elif key == "actual_completion":
-
-                action_value = (
-                    get_action_value(
-                        action,
-                        [
-                            "ACTUAL_COMPLETION",
-                            "Actual Completion",
-                            "COMPLETION_DATE",
-                            "Completion Date",
-                        ],
-                    )
-                )
-
-                if action_value:
-
-                    action_value = (
-                        fmt_date(
-                            action_value
-                        )
-                    )
-
+                field_name = "completion_date"
+                action_value = commitment_date_input_value(stored_commitment.get("completion_date"))
+                input_type = "date"
             elif key == "remarks":
+                field_name = "remarks"
+                action_value = stored_commitment.get("remarks") or ""
+                input_type = "text"
+            else:
+                field_name = ""
+                action_value = ""
+                input_type = "text"
 
-                action_value = (
-                    get_action_value(
-                        action,
-                        [
-                            "REMARKS",
-                            "Remarks",
-                            "NOTE",
-                            "Notes",
-                        ],
-                    )
-                )
-
-            cell_content = html_escape(
-                safe_text(
-                    action_value
-                )
+            cell_content = (
+                f'<input class="npi-commitment-input" type="{input_type}" '
+                f'data-commitment-field="{field_name}" '
+                f'aria-label="{html.escape(heading, quote=True)} for {html.escape(part_key, quote=True)}" '
+                f'title="Edit {html.escape(heading, quote=True)}; click Save Commitment to save changes" '
+                f'value="{html.escape(safe_text(action_value), quote=True)}" '
+                'style="width:100%;min-width:0;max-width:100%;height:31px;box-sizing:border-box;'
+                'padding:4px 5px;border:1px solid #d5e0eb;border-radius:5px;background:#ffffff;'
+                'color:#26364a;font:500 11px Inter,Segoe UI,Arial,sans-serif;outline:none;">'
             )
 
             html_parts.append(
@@ -7165,9 +7293,60 @@ def render_drilldown(df, title):
         <script>
         (function () {
             const root = document.querySelector('.npi-drilldown-wrap') || document;
+            window.addEventListener('message', function (event) {
+                const data = event.data || {};
+                if (data.type !== 'npi_restore_drilldown_scroll') return;
+                const top = Number(data.scroll_top);
+                const left = Number(data.scroll_left);
+                if (Number.isFinite(top)) root.scrollTop = Math.max(0, top);
+                if (Number.isFinite(left)) root.scrollLeft = Math.max(0, left);
+            });
             const rows = root.querySelectorAll('tr.npi-part-detail-clickable');
+            function makeRequestId() {
+                return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+            }
+            function emitCommitmentSave(payload) {
+                window.parent.postMessage({type: 'npi_commitment_save', payload: payload}, '*');
+            }
+            const saveButton = document.getElementById('npi-save-commitment');
+            const saveStatus = document.getElementById('npi-commitment-save-status');
+            let activeRow = null;
+            const dirtyRows = new Map();
+            function activateRow(row) {
+                if (activeRow && activeRow !== row) activeRow.style.outline = '';
+                activeRow = row;
+                if (activeRow) activeRow.style.outline = '2px solid #0e9ab3';
+            }
+            function updateSaveButton() {
+                const count = dirtyRows.size;
+                const enabled = count > 0;
+                if (saveButton) {
+                    saveButton.disabled = !enabled;
+                    saveButton.style.opacity = enabled ? '1' : '.55';
+                }
+                if (saveStatus && !enabled) saveStatus.textContent = 'Edit any number of parts, then save all changes once.';
+                else if (saveStatus && enabled) saveStatus.textContent = count + ' part(s) have unsaved changes. Click Save Commitment once.';
+            }
             rows.forEach((row) => {
-                row.addEventListener('click', function () {
+                row.addEventListener('click', function (event) {
+                    if (event.target && event.target.closest && event.target.closest('input.npi-commitment-input')) {
+                        activateRow(row);
+                        return;
+                    }
+                    activateRow(row);
+                });
+                const markDirty = function (event) {
+                    const target = event.target;
+                    if (!target || !target.matches || !target.matches('input.npi-commitment-input[data-commitment-field]')) return;
+                    activateRow(row);
+                    const key = String(row.getAttribute('data-part-key') || '').trim();
+                    if (key) dirtyRows.set(key, row);
+                    target.style.borderColor = '#0e9ab3';
+                    updateSaveButton();
+                };
+                row.addEventListener('input', markDirty);
+                row.addEventListener('change', markDirty);
+                row.addEventListener('dblclick', function () {
                     let detail;
                     try { detail = JSON.parse(this.getAttribute('data-part-detail') || '{}'); }
                     catch (e) { return; }
@@ -7203,26 +7382,138 @@ def render_drilldown(df, title):
                         *{box-sizing:border-box} html,body{height:100%;overflow:hidden} body{margin:0;background:#eef3f8;color:#1e293b;font-family:Inter,Segoe UI,Arial,sans-serif;padding:14px}
                         .page{max-width:1600px;height:100%;margin:0 auto;display:flex;flex-direction:column;min-height:0}.top{display:flex;flex-shrink:0;justify-content:space-between;align-items:center;gap:20px;margin-bottom:12px;padding:12px 18px;background:linear-gradient(115deg,#172b46,#234b68);border-radius:16px;color:#fff;box-shadow:0 8px 24px rgba(22,43,70,.16)}
                         .eyebrow{font-size:10px;font-weight:800;letter-spacing:1.6px;color:#79d4e4;text-transform:uppercase;margin-bottom:7px}.title{font-size:27px;font-weight:800;line-height:1.2;margin:0;overflow-wrap:anywhere;color:#fff}.subtitle{color:#d3e0ec;font-size:12px;margin-top:7px}
-                        .close{border:1px solid rgba(255,255,255,.3);background:rgba(255,255,255,.1);color:#fff;border-radius:9px;padding:9px 13px;font-weight:700;cursor:pointer;white-space:nowrap}.close:hover{background:rgba(255,255,255,.2)}.detail-layout{display:grid;grid-template-columns:minmax(390px,1.04fr) minmax(470px,1fr);gap:14px;align-items:stretch;flex:1;min-height:0}.right-column{display:flex;flex-direction:column;gap:10px;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}.left-column{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}.left-column>.card{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}.detail-layout>.card{margin-bottom:0;min-width:0}.picture-card,.card{background:#fff;border:1px solid #dfe7f0;border-radius:14px;box-shadow:0 5px 18px rgba(15,23,42,.045)}
-                        .picture-card{min-height:205px;padding:12px;display:grid;grid-template-columns:minmax(0,1fr) minmax(145px,.72fr);gap:12px;align-items:stretch;background:linear-gradient(145deg,#fff,#f5f9fc);overflow:hidden}.picture-stage{min-width:0;display:flex;align-items:center;justify-content:center;border-radius:10px;background:#fff;border:1px solid #edf1f6;padding:8px}.part-picture{display:block;max-width:100%;max-height:178px;object-fit:contain}.picture-placeholder{min-height:170px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px;text-align:center}.picture-stats{display:grid;grid-template-rows:1fr 1fr;gap:10px;min-width:0}.stat-tile{display:flex;flex-direction:column;justify-content:center;padding:12px 13px;border-radius:11px;background:linear-gradient(140deg,#20354f,#2c5873);color:#fff;min-width:0}.stat-tile.qty{background:linear-gradient(140deg,#087f9b,#10a4b7)}.stat-label{font-size:10px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;color:#d5e7ef;margin-bottom:8px}.stat-value{font-size:clamp(23px,2.5vw,34px);font-weight:850;line-height:1.05;overflow-wrap:anywhere;color:#fff}.process-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 0 13px}.process-stat{padding:10px 12px;border-radius:10px;border:1px solid #e0eaf1;background:#f5f9fc}.process-stat .label{margin-bottom:4px}.process-stat .value{font-size:18px;font-weight:800;color:#20354f}
-                        .card{padding:16px;margin-bottom:0}.section-title{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:800;color:#20354f;margin:0 0 13px}.section-title:before{content:'';width:4px;height:18px;border-radius:4px;background:#0e9ab3}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.field{padding:9px 10px;border:1px solid #e8eef5;border-radius:9px;background:#f8fafc;min-width:0}.label{font-size:9px;text-transform:uppercase;letter-spacing:.7px;color:#718096;font-weight:800;margin-bottom:5px}.value{font-size:12px;font-weight:650;color:#26364a;overflow-wrap:anywhere;min-height:15px}.process-card{padding:13px;position:relative;display:flex;flex-direction:column;flex:1;min-height:0}.process-meta{font-size:10px;color:#718096;margin:-5px 0 8px}.routing-wrap{flex:1;max-height:none;min-height:100px;overflow:auto;border:1px solid #e1e8f0;border-radius:10px;scrollbar-width:thin;scrollbar-color:#c2cedb #f4f7fa}.routing{width:100%;border-collapse:separate;border-spacing:0;font-size:11px;overflow:hidden}.routing th{position:sticky;top:0;z-index:2;background:#20354f;color:#fff;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.55px;padding:11px 10px;white-space:normal}.routing td{padding:9px 10px;border-top:1px solid #e8edf3;background:#fff;vertical-align:top}.routing tr:nth-child(even) td{background:#f7f9fc}.routing tbody tr:hover td{background:#eaf6fa}.routing .step{width:38px;color:#0e8aa3;font-weight:800;text-align:center}.routing td.actual-late{background:#fee2e2!important;color:#b91c1c;font-weight:800;box-shadow:inset 3px 0 0 #dc2626}.empty{text-align:center;color:#94a3b8;padding:24px!important}.footer{font-size:10px;color:#8190a3;text-align:right;margin-top:10px}@media(max-width:980px){body{padding:10px}.detail-layout{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}.process-card{position:relative}.routing-wrap{max-height:none;min-height:80px}.top{padding:10px 13px;margin-bottom:9px}.title{font-size:22px}.card{padding:12px}}@media(max-width:650px){.detail-layout{grid-template-columns:1fr 1fr;gap:8px}.picture-card{grid-template-columns:1fr}.picture-stage{min-height:100px}.picture-stats{grid-template-columns:1fr;grid-template-rows:auto}.stat-value{font-size:20px}.grid{grid-template-columns:1fr}.process-stats{grid-template-columns:1fr}.action-form{grid-template-columns:1fr}.action-form .remark-field{grid-column:auto}.routing th,.routing td{padding:6px 5px;font-size:9px}.section-title{font-size:12px}.card,.process-card{padding:9px}}
+                        .close{border:1px solid rgba(255,255,255,.3);background:rgba(255,255,255,.1);color:#fff;border-radius:9px;padding:9px 13px;font-weight:700;cursor:pointer;white-space:nowrap}.close:hover{background:rgba(255,255,255,.2)}.detail-layout{display:grid;grid-template-columns:minmax(390px,1.04fr) minmax(470px,1fr);gap:14px;align-items:stretch;flex:1;min-height:0}.right-column{display:flex;flex-direction:column;gap:10px;min-width:0;min-height:0;overflow:hidden}.left-column{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0;overflow:hidden}.left-column>.card{flex:1;min-height:0;overflow:hidden}.detail-layout>.card{margin-bottom:0;min-width:0}.picture-card,.card{background:#fff;border:1px solid #dfe7f0;border-radius:14px;box-shadow:0 5px 18px rgba(15,23,42,.045)}
+                        .picture-card{min-height:170px;padding:10px;display:grid;grid-template-columns:minmax(0,1fr) minmax(145px,.72fr);gap:12px;align-items:stretch;background:linear-gradient(145deg,#fff,#f5f9fc);overflow:hidden}.picture-stage{min-width:0;display:flex;align-items:center;justify-content:center;border-radius:10px;background:#fff;border:1px solid #edf1f6;padding:8px}.part-picture{display:block;max-width:100%;max-height:145px;object-fit:contain}.picture-placeholder{min-height:140px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px;text-align:center}.picture-stats{display:grid;grid-template-rows:1fr 1fr;gap:10px;min-width:0}.stat-tile{display:flex;flex-direction:column;justify-content:center;padding:12px 13px;border-radius:11px;background:linear-gradient(140deg,#20354f,#2c5873);color:#fff;min-width:0}.stat-tile.qty{background:linear-gradient(140deg,#087f9b,#10a4b7)}.stat-label{font-size:10px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;color:#d5e7ef;margin-bottom:8px}.stat-value{font-size:clamp(23px,2.5vw,34px);font-weight:850;line-height:1.05;overflow-wrap:anywhere;color:#fff}.process-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:0 0 7px}.process-stat{padding:6px 8px;border-radius:10px;border:1px solid #e0eaf1;background:#f5f9fc}.process-stat .label{margin-bottom:3px}.process-stat .value{font-size:15px;font-weight:800;color:#20354f}
+                        .card{padding:16px;margin-bottom:0}.section-title{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:800;color:#20354f;margin:0 0 8px}.section-title:before{content:'';width:4px;height:18px;border-radius:4px;background:#0e9ab3}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.field{padding:9px 10px;border:1px solid #e8eef5;border-radius:9px;background:#f8fafc;min-width:0}.label{font-size:9px;text-transform:uppercase;letter-spacing:.7px;color:#718096;font-weight:800;margin-bottom:5px}.value{font-size:12px;font-weight:650;color:#26364a;overflow-wrap:anywhere;min-height:15px}.process-card{padding:10px 11px;position:relative;display:flex;flex-direction:column;flex:1 1 auto;min-height:0;overflow:hidden}.process-meta{font-size:10px;color:#718096;margin:-5px 0 5px}.routing-wrap{flex:1 1 auto;height:0;max-height:none;min-height:0;overflow:auto;border:1px solid #e1e8f0;border-radius:10px;scrollbar-width:thin;scrollbar-color:#c2cedb #f4f7fa}.routing{width:100%;border-collapse:separate;border-spacing:0;font-size:11px;overflow:hidden}.routing th{position:sticky;top:0;z-index:2;background:#20354f;color:#fff;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.45px;padding:6px 7px;white-space:normal}.routing td{padding:5px 7px;border-top:1px solid #e8edf3;background:#fff;vertical-align:top}.routing tr:nth-child(even) td{background:#f7f9fc}.routing tbody tr:hover td{background:#eaf6fa}.routing .step{width:38px;color:#0e8aa3;font-weight:800;text-align:center}.routing td.actual-late{background:#fee2e2!important;color:#b91c1c;font-weight:800;box-shadow:inset 3px 0 0 #dc2626}.empty{text-align:center;color:#94a3b8;padding:24px!important}.footer{font-size:9px;color:#8190a3;text-align:right;margin-top:5px;flex-shrink:0}@media(max-width:980px){body{padding:10px}.detail-layout{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}.process-card{position:relative}.routing-wrap{max-height:none;min-height:0}.top{padding:10px 13px;margin-bottom:9px}.title{font-size:22px}.card{padding:12px}}@media(max-width:650px){.detail-layout{grid-template-columns:1fr 1fr;gap:8px}.picture-card{grid-template-columns:1fr}.picture-stage{min-height:100px}.picture-stats{grid-template-columns:1fr;grid-template-rows:auto}.stat-value{font-size:20px}.grid{grid-template-columns:1fr}.process-stats{grid-template-columns:1fr}.action-form{grid-template-columns:1fr}.action-form .remark-field{grid-column:auto}.routing th,.routing td{padding:6px 5px;font-size:9px}.section-title{font-size:12px}.card,.process-card{padding:9px}}
                         @media(max-width:520px){.picture-card{grid-template-columns:1fr}.picture-stage{min-height:150px}.picture-stats{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:auto}.stat-value{font-size:25px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.card,.process-card{padding:12px}.routing th,.routing td{padding:8px 7px}}
                     </style></head><body><main class="page"><header class="top"><div><div class="eyebrow">NPI Control Tower · Part Profile</div><h1 class="title">${esc(detail['Part Number'])}</h1><div class="subtitle">Purchase Order: ${esc(detail['PO Number'])} &nbsp;·&nbsp; Job: ${esc(detail['Job Number'])}</div></div><button class="close" onclick="window.close()">✕ Close</button></header>
                     <section class="detail-layout"><div class="left-column"><div class="picture-card"><div class="picture-stage">${picture}</div><div class="picture-stats"><div class="stat-tile qty"><div class="stat-label">Qty</div><div class="stat-value">${esc(detail.Qty)}</div></div><div class="stat-tile"><div class="stat-label">Engineer</div><div class="stat-value" style="font-size:clamp(17px,1.8vw,25px)">${esc(detail.Engineer)}</div></div></div></div><section class="card"><h2 class="section-title">Part Informations</h2><div class="grid">${field('PO Number',detail['PO Number'])}${field('Order Date',detail['Order Date'])}${field('Exwork Date',detail['Exwork Date'])}${field('Job Number',detail['Job Number'])}${field('Nesting Number',detail['Nesting Number'] === '' || detail['Nesting Number'] == null ? '' : (Number.isFinite(Number(detail['Nesting Number'])) ? String(Math.trunc(Number(detail['Nesting Number']))) : detail['Nesting Number']))}${field('Material',detail.Material)}${field('Plating',detail.Plating)}${field('Finishing',detail.Finishing)}${field('Subpart 2D Rev',detail['Subpart 2D Rev'])}${field('Subpart 3D Rev',detail['Subpart 3D Rev'])}${field('Subpart KK Rev',detail['Subpart KK Rev'])}</div></section></div>
-                    <div class="right-column"><section class="card process-card"><h2 class="section-title">Process</h2><div class="process-meta">${routing.length} process step(s) · Scroll within this panel to view all steps</div><div class="process-stats"><div class="process-stat"><div class="label">Delay Days</div><div class="value">${esc(detail['Delay Days'])}</div></div><div class="process-stat"><div class="label">Aging</div><div class="value">${esc(detail.Aging)}</div></div><div class="process-stat"><div class="label">First Process Plan Date</div><div class="value">${esc(detail['First Process Plan Date'])}</div></div></div><div class="routing-wrap"><table class="routing"><thead><tr><th style="width:42px">Step</th><th style="width:31%">Operation</th><th>Plan Start Date</th><th>Actual Start Date</th></tr></thead><tbody>${routingRows}</tbody></table></div><div class="footer">Actual Start Date turns red when it is later than Plan Start Date</div></section><section class="card action-card"><h2 class="section-title">Commitment & Remarks</h2><div class="action-form"><label>Owner<input type="text" id="detail-owner" placeholder="Enter owner"></label><label>Commitment Date<input type="date" id="detail-commitment-date"></label><label class="remark-field">Remark<textarea id="detail-remark" rows="3" placeholder="Enter remark"></textarea></label></div><div class="action-note">Enter the owner, target commitment date and remark for this part.</div></section></div></section></main><style>.action-card{margin-top:0;flex-shrink:0}.action-form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.action-form label{display:flex;flex-direction:column;gap:6px;font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:#718096}.action-form input,.action-form textarea{width:100%;font:500 12px Inter,Segoe UI,Arial,sans-serif;color:#26364a;background:#f8fafc;border:1px solid #dbe5ef;border-radius:9px;padding:10px;outline:none}.action-form input:focus,.action-form textarea:focus{border-color:#0e9ab3;box-shadow:0 0 0 3px rgba(14,154,179,.12)}.action-form .remark-field{grid-column:1/-1}.action-form textarea{resize:vertical;min-height:72px}.action-note{margin-top:9px;font-size:10px;color:#8190a3}@media(max-width:520px){.process-stats{grid-template-columns:1fr}.action-form{grid-template-columns:1fr}}</style></body></html>`);
+                    <div class="right-column"><section class="card process-card"><h2 class="section-title">Process</h2><div class="process-meta">${routing.length} process step(s) · Scroll within this panel to view all steps</div><div class="process-stats"><div class="process-stat"><div class="label">Delay Days</div><div class="value">${esc(detail['Delay Days'])}</div></div><div class="process-stat"><div class="label">Aging</div><div class="value">${esc(detail.Aging)}</div></div><div class="process-stat"><div class="label">First Process Plan Date</div><div class="value">${esc(detail['First Process Plan Date'])}</div></div></div><div class="routing-wrap"><table class="routing"><thead><tr><th style="width:42px">Step</th><th style="width:31%">Operation</th><th>Plan Start Date</th><th>Actual Start Date</th></tr></thead><tbody>${routingRows}</tbody></table></div><div class="footer">Actual Start Date turns red when it is later than Plan Start Date</div></section><section class="card action-card"><h2 class="section-title">Commitment & Remarks</h2><div class="action-form"><label>Owner<input type="text" id="detail-owner" placeholder="Enter owner" value="${esc(detail['Commitment Owner'] || '')}"></label><label>Commitment Date<input type="date" id="detail-commitment-date" value="${esc(detail['Commitment Date'] || '')}"></label><label>Completion Date<input type="date" id="detail-completion-date" value="${esc(detail['Completion Date'] || '')}"></label><label class="remark-field">Remark<textarea id="detail-remark" rows="3" placeholder="Enter remark">${esc(detail['Commitment Remark'] || '')}</textarea></label></div><div class="action-actions"><button id="detail-save-commitment" class="save-commitment">Save Commitment</button><span id="detail-save-status" role="status"></span></div><div class="action-note">Saved records are shared with other approved users. Previous values are retained for audit.</div></section></div></section></main><style>.action-card{margin-top:0;flex:0 0 auto;overflow:hidden;padding:12px}.action-form{display:grid;grid-template-columns:1fr 1fr;gap:7px}.action-form label{display:flex;flex-direction:column;gap:6px;font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:#718096}.action-form input,.action-form textarea{width:100%;font:500 12px Inter,Segoe UI,Arial,sans-serif;color:#26364a;background:#f8fafc;border:1px solid #dbe5ef;border-radius:8px;padding:7px 8px;outline:none}.action-form input:focus,.action-form textarea:focus{border-color:#0e9ab3;box-shadow:0 0 0 3px rgba(14,154,179,.12)}.action-form .remark-field{grid-column:1/-1}.action-form textarea{resize:none;min-height:46px;height:46px}.action-note{margin-top:6px;font-size:10px;color:#8190a3}.action-actions{display:flex;align-items:center;gap:12px;margin-top:8px}.save-commitment{border:0;border-radius:9px;background:#087f8c;color:#fff;padding:10px 16px;font-weight:800;cursor:pointer}.save-commitment:disabled{opacity:.65;cursor:wait}#detail-save-status{font-size:11px;color:#087f8c;font-weight:700}@media(max-width:520px){.process-stats{grid-template-columns:1fr}.action-form{grid-template-columns:1fr}}</style></body></html>`);
                     popup.document.close();
+                    const ownerInput = popup.document.getElementById('detail-owner');
+                    const commitmentInput = popup.document.getElementById('detail-commitment-date');
+                    const completionInput = popup.document.getElementById('detail-completion-date');
+                    const remarkInput = popup.document.getElementById('detail-remark');
+                    const saveButton = popup.document.getElementById('detail-save-commitment');
+                    const status = popup.document.getElementById('detail-save-status');
+                    if (saveButton) saveButton.addEventListener('click', function () {
+                        saveButton.disabled = true;
+                        status.textContent = 'Sending save request…';
+                        const payload = {
+                            request_id: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)),
+                            part_key: String(detail['Commitment Part Key'] || detail['Part Number'] || '').trim(),
+                            owner: ownerInput ? ownerInput.value : '',
+                            commitment_date: commitmentInput ? commitmentInput.value : '',
+                            completion_date: completionInput ? completionInput.value : '',
+                            remarks: remarkInput ? remarkInput.value : ''
+                        };
+                        let sent = false;
+                        try {
+                            if ('BroadcastChannel' in window) {
+                                const channel = new BroadcastChannel('npi_commitment_channel');
+                                channel.postMessage({type: 'npi_commitment_save', payload: payload});
+                                channel.close();
+                                sent = true;
+                            }
+                        } catch (e) {}
+                        if (!sent && window.opener && !window.opener.closed) {
+                            try {
+                                window.opener.postMessage({type: 'npi_commitment_save', payload: payload}, '*');
+                                sent = true;
+                            } catch (e) {}
+                        }
+                        status.textContent = sent ? 'Save request sent. Check the dashboard for confirmation.' : 'Unable to send the save request. Keep this window open and try again.';
+                        setTimeout(function () { saveButton.disabled = false; }, 2500);
+                    });
                 });
             });
+            if (saveButton) saveButton.addEventListener('click', function () {
+                if (!dirtyRows.size) return;
+                const records = [];
+                dirtyRows.forEach((row, key) => {
+                    const values = {};
+                    row.querySelectorAll('input.npi-commitment-input[data-commitment-field]').forEach((input) => {
+                        values[input.getAttribute('data-commitment-field')] = input.value;
+                    });
+                    const record = {
+                        part_key: key,
+                        owner: Object.prototype.hasOwnProperty.call(values, 'owner') ? values.owner : '',
+                        commitment_date: Object.prototype.hasOwnProperty.call(values, 'commitment_date') ? values.commitment_date : '',
+                        completion_date: Object.prototype.hasOwnProperty.call(values, 'completion_date') ? values.completion_date : '',
+                        remarks: Object.prototype.hasOwnProperty.call(values, 'remarks') ? values.remarks : ''
+                    };
+                    // Keep the popup payload in sync without reloading the drilldown iframe.
+                    try {
+                        const detail = JSON.parse(row.getAttribute('data-part-detail') || '{}');
+                        detail['Commitment Owner'] = record.owner;
+                        detail['Commitment Date'] = record.commitment_date;
+                        detail['Completion Date'] = record.completion_date;
+                        detail['Commitment Remark'] = record.remarks;
+                        row.setAttribute('data-part-detail', JSON.stringify(detail));
+                    } catch (e) {}
+                    records.push(record);
+                });
+                const payload = {
+                    type: 'npi_commitment_save',
+                    request_id: makeRequestId(),
+                    records: records,
+                    scroll_top: root.scrollTop || 0,
+                    scroll_left: root.scrollLeft || 0
+                };
+                saveButton.disabled = true;
+                saveButton.style.opacity = '.55';
+                if (saveStatus) saveStatus.textContent = 'Saving all changes for ' + records.length + ' part(s)…';
+                emitCommitmentSave(payload);
+                dirtyRows.clear();
+            });
+            updateSaveButton();
         })();
         </script>
         """
     )
 
-    components.html(
-        "".join(html_parts),
+    component_event = _npi_drilldown_component(
+        html_content="".join(html_parts),
         height=760,
-        scrolling=False,
+        key="npi_drilldown_commitment_bridge",
+        default=None,
     )
+    if isinstance(component_event, dict) and component_event.get("type") == "npi_commitment_save":
+        event_payload = component_event.get("payload")
+        if isinstance(event_payload, dict):
+            event_request_id = safe_text(event_payload.get("request_id"))
+            if event_request_id and event_request_id != st.session_state.get("_npi_last_commitment_request_id"):
+                raw_records = event_payload.get("records")
+                if not isinstance(raw_records, list):
+                    raw_records = [event_payload]
+                records = [record for record in raw_records if isinstance(record, dict)]
+                saved_parts = []
+                try:
+                    for record in records:
+                        part_key_to_save = safe_text(record.get("part_key")).strip()
+                        if not part_key_to_save:
+                            continue
+                        save_supabase_commitment_patch(
+                            part_key_to_save,
+                            {
+                                "owner": safe_text(record.get("owner")),
+                                "commitment_date": safe_text(record.get("commitment_date")) or None,
+                                "completion_date": safe_text(record.get("completion_date")) or None,
+                                "remarks": safe_text(record.get("remarks")),
+                            },
+                            user_id=current_user_id,
+                        )
+                        saved_parts.append(part_key_to_save)
+                    if not saved_parts:
+                        raise ValueError("No valid part records were included in the save request.")
+                    st.session_state["_npi_last_commitment_request_id"] = event_request_id
+                    st.success(f"Commitment saved for {len(saved_parts)} part(s).")
+                except Exception as commitment_error:
+                    st.session_state["_npi_last_commitment_request_id"] = event_request_id
+                    st.error(
+                        f"Unable to save commitment batch. Saved before error: "
+                        f"{', '.join(saved_parts) or 'none'}. Error: {commitment_error}"
+                    )
 
 
 # ============================================================

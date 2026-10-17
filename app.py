@@ -6719,6 +6719,21 @@ def render_drilldown(df, title):
         """
     )
 
+    # QR Scanner V1: open the existing Part Detail popup from a QR scan.
+    # The blank popup is opened directly from the Scan button click so mobile
+    # browsers are less likely to block it after the asynchronous camera scan.
+    html_parts.append(
+        """
+        <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+        <div id="npi-qr-toolbar" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 12px;margin:0 0 8px;background:#f0f8fb;border:1px solid #cce5ed;border-radius:10px;">
+          <button type="button" id="npi-qr-start" style="border:0;border-radius:8px;background:#087f8c;color:#fff;padding:10px 16px;font:750 13px Inter,Segoe UI,Arial,sans-serif;cursor:pointer;touch-action:manipulation;">📷 Scan Job Traveller QR</button>
+          <button type="button" id="npi-qr-stop" style="display:none;border:1px solid #b8cbd6;border-radius:8px;background:#fff;color:#34495e;padding:10px 14px;font:700 12px Inter,Segoe UI,Arial,sans-serif;cursor:pointer;touch-action:manipulation;">Stop Camera</button>
+          <span id="npi-qr-status" role="status" aria-live="polite" style="flex:1;min-width:180px;font:600 12px Inter,Segoe UI,Arial,sans-serif;color:#36556a;">Scan the QR code containing the Part Number.</span>
+          <div id="npi-qr-reader" style="display:none;flex:1 1 280px;width:100%;max-width:460px;min-width:240px;"></div>
+        </div>
+        """
+    )
+
     # Keep the save toolbar outside the horizontal-scroll container so it stays
     # visible while the user scrolls across to the commitment columns.
     html_parts.append(
@@ -7276,6 +7291,34 @@ def render_drilldown(df, title):
             "</tr>"
         )
 
+    # Keep a hidden Part Detail record for every unique part in the loaded
+    # Unique-Part Dataset. This lets QR scans open a part even when current
+    # drilldown filters or pagination do not display its visible row.
+    visible_part_keys = {
+        safe_text(get_value(row, part_col)).strip()
+        for _, row in page_df.iterrows()
+    }
+    qr_hidden_count = 0
+    for _, qr_row in unique_df.iterrows():
+        qr_part_key = safe_text(get_value(qr_row, part_col)).strip()
+        if not qr_part_key or qr_part_key in visible_part_keys:
+            continue
+        qr_detail_payload = build_part_detail_payload(qr_row, qr_part_key)
+        qr_stored_commitment = commitment_lookup.get(qr_part_key, {}) or {}
+        qr_detail_payload["Commitment Part Key"] = qr_part_key
+        qr_detail_payload["Commitment Owner"] = safe_text(qr_stored_commitment.get("owner", ""))
+        qr_detail_payload["Commitment Date"] = safe_text(qr_stored_commitment.get("commitment_date", ""))
+        qr_detail_payload["Completion Date"] = safe_text(qr_stored_commitment.get("completion_date", ""))
+        qr_detail_payload["Commitment Remark"] = safe_text(qr_stored_commitment.get("remarks", ""))
+        qr_detail_json = json.dumps(qr_detail_payload, ensure_ascii=False, separators=(",", ":"))
+        html_parts.append(
+            '<tr class="npi-drilldown-row npi-part-detail-clickable npi-qr-hidden-row" '
+            f'data-part-key="{html.escape(qr_part_key, quote=True)}" '
+            f'data-part-detail="{html.escape(qr_detail_json, quote=True)}" '
+            'style="display:none!important;height:0!important;"><td></td></tr>'
+        )
+        qr_hidden_count += 1
+
     html_parts.append(
         "</tbody>"
     )
@@ -7350,7 +7393,8 @@ def render_drilldown(df, title):
                     let detail;
                     try { detail = JSON.parse(this.getAttribute('data-part-detail') || '{}'); }
                     catch (e) { return; }
-                    const popup = window.open('', '_blank', 'width=1180,height=900,resizable=yes,scrollbars=yes');
+                    const popup = window.__npi_qr_preopened_popup || window.open('', '_blank', 'width=1180,height=900,resizable=yes,scrollbars=yes');
+                    window.__npi_qr_preopened_popup = null;
                     if (!popup) {
                         alert('Part Detail pop-up was blocked by your browser. Please allow pop-ups for this app and click the row again.');
                         return;
@@ -7465,6 +7509,87 @@ def render_drilldown(df, title):
                 if (saveStatus) saveStatus.textContent = 'Saving all changes for ' + records.length + ' part(s)…';
                 emitCommitmentSave(payload);
                 dirtyRows.clear();
+            });
+            // QR Scanner V1. The hidden rows above are sourced from the complete
+            // Unique-Part Dataset, so current filters and pagination do not limit lookup.
+            const qrStart = document.getElementById('npi-qr-start');
+            const qrStop = document.getElementById('npi-qr-stop');
+            const qrStatus = document.getElementById('npi-qr-status');
+            const qrReader = document.getElementById('npi-qr-reader');
+            let qrScanner = null;
+            let qrBusy = false;
+            const normalizePartKey = value => String(value == null ? '' : value).trim().replace(/\\s+/g, ' ').toUpperCase();
+            function qrSetStatus(message, isError) {
+                if (!qrStatus) return;
+                qrStatus.textContent = message;
+                qrStatus.style.color = isError ? '#b42318' : '#36556a';
+            }
+            async function stopQrScanner() {
+                if (qrScanner) {
+                    try { if (qrScanner.isScanning) await qrScanner.stop(); } catch (e) {}
+                    try { await qrScanner.clear(); } catch (e) {}
+                    qrScanner = null;
+                }
+                if (qrReader) qrReader.style.display = 'none';
+                if (qrStop) qrStop.style.display = 'none';
+                if (qrStart) qrStart.style.display = 'inline-block';
+            }
+            if (qrStart) qrStart.addEventListener('click', async function () {
+                if (qrBusy) return;
+                qrBusy = true;
+                // Open synchronously in the click gesture; the scan callback is asynchronous.
+                window.__npi_qr_preopened_popup = window.open('', '_blank', 'width=1180,height=900,resizable=yes,scrollbars=yes');
+                if (!window.__npi_qr_preopened_popup) {
+                    qrBusy = false;
+                    qrSetStatus('Browser blocked the popup. Allow pop-ups for this app, then scan again.', true);
+                    return;
+                }
+                try { window.__npi_qr_preopened_popup.document.open(); window.__npi_qr_preopened_popup.document.write('<!doctype html><title>NPI Part Detail</title><p style="font:16px Arial;padding:24px">Waiting for QR scan…</p>'); window.__npi_qr_preopened_popup.document.close(); } catch (e) {}
+                if (typeof Html5Qrcode === 'undefined') {
+                    try { window.__npi_qr_preopened_popup.close(); } catch (e) {}
+                    window.__npi_qr_preopened_popup = null;
+                    qrBusy = false;
+                    qrSetStatus('QR scanner library could not load. Check internet access and refresh the app.', true);
+                    return;
+                }
+                qrSetStatus('Requesting camera permission…');
+                qrReader.style.display = 'block';
+                qrStart.style.display = 'none';
+                qrStop.style.display = 'inline-block';
+                try {
+                    qrScanner = new Html5Qrcode('npi-qr-reader');
+                    const config = { fps: 10, qrbox: { width: 230, height: 230 }, aspectRatio: 1.0 };
+                    await qrScanner.start({ facingMode: 'environment' }, config, async function (decodedText) {
+                        if (!qrBusy) return;
+                        qrBusy = false;
+                        const scannedKey = normalizePartKey(decodedText);
+                        await stopQrScanner();
+                        const match = Array.from(root.querySelectorAll('tr.npi-part-detail-clickable')).find(row => normalizePartKey(row.getAttribute('data-part-key')) === scannedKey);
+                        if (!match) {
+                            if (window.__npi_qr_preopened_popup) { try { window.__npi_qr_preopened_popup.close(); } catch (e) {} }
+                            window.__npi_qr_preopened_popup = null;
+                            qrSetStatus('Part Number Not Found: ' + String(decodedText).trim(), true);
+                            return;
+                        }
+                        qrSetStatus('Part Number found: ' + String(match.getAttribute('data-part-key')) + '. Opening Part Detail…');
+                        match.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));
+                        setTimeout(function () { if (qrStatus) qrSetStatus('Part Detail opened for ' + String(match.getAttribute('data-part-key')) + '.'); }, 250);
+                    }, function () { /* Ignore intermediate camera frames with no QR code. */ });
+                    qrSetStatus('Camera ready. Point it at the job traveller QR code.');
+                } catch (error) {
+                    qrBusy = false;
+                    await stopQrScanner();
+                    if (window.__npi_qr_preopened_popup) { try { window.__npi_qr_preopened_popup.close(); } catch (e) {} }
+                    window.__npi_qr_preopened_popup = null;
+                    qrSetStatus('Unable to start camera. Check browser camera permission and try Chrome/Firefox again. ' + (error && error.message ? error.message : ''), true);
+                }
+            });
+            if (qrStop) qrStop.addEventListener('click', async function () {
+                qrBusy = false;
+                await stopQrScanner();
+                if (window.__npi_qr_preopened_popup) { try { window.__npi_qr_preopened_popup.close(); } catch (e) {} }
+                window.__npi_qr_preopened_popup = null;
+                qrSetStatus('Scan stopped.');
             });
             updateSaveButton();
         })();

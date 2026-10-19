@@ -1,0 +1,14 @@
+{
+  "status": "TEST CANDIDATE \u2014 awaiting local acceptance; not deployed or locked",
+  "locked_package": "NPI_Control_Tower_V10_Popup_Repeated_Save_Test_Candidate.zip",
+  "locked_package_sha256": "21cc831371e3cb66b3d7bf0a706f0f633c373de7ae9ca80db5b4a81e01a769e7",
+  "locked_package_library_file_id": "libfile_1078b952170481919278bc5de7a16bac",
+  "locked_source_sha256": {
+    "app.py": "3046ca15675be63c549fd644e83749e20ed6f553279fa38543fbce8b4ad597dc",
+    "npi_drilldown_component/index.html": "b6d923bc5f06dfd2f46d06d45204dfb6fb70d0b46f1180bcace0d5688b73106e"
+  },
+  "runtime_changes": [
+    "app.py"
+  ],
+  "candidate_app_sha256": "b59f10ae2cef4f76412464a6af290641c67b4e1c65c7e4c76b808e74341b68f3"
+}

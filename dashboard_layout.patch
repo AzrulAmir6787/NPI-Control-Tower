@@ -1,0 +1,1365 @@
+--- LOCKED_V10_popup_repeated_save/app.py
++++ CANDIDATE_standard_dashboard/app.py
+@@ -2726,6 +2726,11 @@
+     # 7. FLOATING HTML
+     # ============================================================
+ 
++    # Opaque, stable per-account layout namespace; auth/access code is unchanged.
++    dashboard_layout_owner = hashlib.sha256(
++        ("npi-dashboard-layout-v5:" + str(st.session_state.get("npi_user_id", ""))).encode("utf-8")
++    ).hexdigest()[:32]
++
+     floating_html = f"""
+ <style>
+ 
+@@ -3626,23 +3631,36 @@
+     border-radius: 999px;
+ }}
+ 
+-/* Mobile/tablet: use a normal vertical layout instead of overlapping draggable panels. */
+-@media (max-width: 760px) {{
+-    html, body {{ height: auto !important; overflow: visible !important; }}
+-    .npi-floating-stage {{ height: auto !important; min-height: 0 !important; display: flex !important; flex-direction: column !important; gap: 10px !important; overflow: visible !important; padding: 0 2px 10px !important; }}
+-    .npi-floating-panel {{ position: relative !important; inset: auto !important; left: auto !important; top: auto !important; right: auto !important; bottom: auto !important; width: 100% !important; min-width: 0 !important; max-width: 100% !important; height: auto !important; min-height: 0 !important; max-height: none !important; resize: none !important; margin: 0 !important; overflow: hidden !important; box-shadow: 0 2px 8px rgba(15,35,60,.09) !important; }}
+-    .npi-floating-header {{ min-height: 42px !important; padding: 10px 12px !important; cursor: default !important; touch-action: manipulation !important; }}
+-    .npi-floating-header [data-drag-handle] {{ cursor: default !important; }}
+-    #npi-executive-panel {{ order: 1 !important; }}
+-    #npi-delay-bucket-panel {{ order: 2 !important; }}
+-    #npi-hotspot-panel {{ order: 3 !important; }}
+-    #npi-delay-commitment-panel {{ order: 4 !important; }}
+-    #npi-hotspot-panel .npi-hotspot-content {{ max-height: 240px !important; overflow-y: auto !important; -webkit-overflow-scrolling: touch !important; }}
+-    #npi-delay-bucket-panel .npi-delay-bucket-content {{ max-height: none !important; overflow: visible !important; }}
+-    #npi-delay-commitment-panel .npi-delay-commitment-content {{ max-height: none !important; overflow: visible !important; }}
+-    #npi-dashboard-drilldown-boundary {{ display: none !important; }}
+-    .npi-floating-panel button {{ min-height: 42px !important; touch-action: manipulation !important; }}
+-}}
++/* Standardized layout V5. Geometry is shared with the native Enquiry form. */
++.npi-floating-stage {{ height:624px; overflow:hidden; }}
++#npi-dashboard-scroll {{ position:absolute; inset:0 0 18px; overflow:auto; scrollbar-gutter:stable; overscroll-behavior:contain; }}
++#npi-layout-canvas {{ position:relative; width:100%; min-height:1px; }}
++.npi-floating-panel {{ min-width:0; min-height:120px; border:1px solid #d8e2ed; border-radius:12px; box-shadow:0 3px 10px rgba(25,48,76,.07); }}
++.npi-enquiry-slot {{ position:absolute; pointer-events:none; }}
++.npi-floating-header {{ height:38px; padding:0 12px; background:#20354f; color:#fff; font:800 12px Arial,Helvetica,sans-serif; letter-spacing:.35px; border-bottom:1px solid #d8e2ed; }}
++.npi-executive-subtitle {{ color:#d6e3ef; font-size:10px; }}
++.npi-floating-reset {{ font-size:9px; padding:4px 6px; }}
++.npi-floating-legend {{ flex:1 1 0; width:0; min-width:0; }}
++.npi-float-legend {{ font-family:Arial,Helvetica,sans-serif; font-size:11px; }}
++.npi-float-label {{ flex:1 1 auto; min-width:0; white-space:normal; margin-right:6px; overflow-wrap:anywhere; }}
++.npi-floating-donut svg {{ display:block; width:100%; height:100%; }}
++.npi-executive-floating-content {{ overflow:auto; }}
++#npi-delay-commitment-panel {{ border-color:#d5aeb2; }}
++#npi-delay-commitment-panel .npi-commitment-count {{ font-size:28px; }}
++#npi-delay-bucket-panel .npi-delay-bucket-label {{ font-size:10px; }}
++#npi-delay-bucket-panel .npi-delay-bucket-count {{ font-size:24px; }}
++#npi-hotspot-panel .npi-hotspot-row {{ min-height:34px; }}
++#npi-hotspot-panel .npi-hotspot-operation {{ white-space:normal; overflow-wrap:anywhere; }}
++.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-floating-panel {{ resize:none !important; }}
++.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-floating-header {{ cursor:default; }}
++.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-executive-floating-inner {{ flex-direction:column; gap:10px; }}
++.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-floating-legend {{ flex:0 0 auto; width:100%; }}
++.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-floating-panel button {{ min-height:38px; }}
++.npi-floating-stage[data-layout-mode="mobile"] #npi-delay-commitment-panel .npi-delay-commitment-content {{ grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:repeat(2,minmax(0,1fr)); }}
++.npi-floating-stage[data-layout-mode="mobile"] .npi-floating-header {{ font-size:11px; }}
++.npi-floating-stage[data-layout-mode="mobile"] .npi-floating-panel button {{ min-height:42px; touch-action:manipulation; }}
++.npi-floating-stage[data-layout-mode="mobile"] .npi-float-legend {{ min-height:38px; }}
++
+ 
+ </style>
+ 
+@@ -3650,7 +3668,9 @@
+ <div
+     class="npi-floating-stage"
+     id="npi-floating-stage"
++    data-layout-owner="{dashboard_layout_owner}"
+ >
++<div id="npi-dashboard-scroll"><div id="npi-layout-canvas">
+ 
+     <!-- ========================================================
+          PART DELAY DAYS BUCKET
+@@ -3767,6 +3787,8 @@
+         </div>
+     </div>
+ 
++    <div class="npi-enquiry-slot" data-layout-id="enquiry" aria-hidden="true"></div>
++</div></div>
+     <div id="npi-dashboard-drilldown-boundary"
+          class="npi-dashboard-drilldown-boundary"
+          role="separator"
+@@ -3787,561 +3809,173 @@
+        STORAGE
+        ======================================================== */
+ 
+-    const STORAGE_KEY =
+-        "npi_control_tower_top01_layout_v2";
+-
+-
+-    const DEFAULT_LAYOUT = {{
+-
+-
+-        executive: {{
+-            left: 300,
+-            top: 12,
+-            width: 650,
+-            height: 370
+-        }},
+-
+-        delayBucket: {{
+-            left: 12,
+-            top: 200,
+-            width: 270,
+-            height: 245
+-        }},
+-
+-        delayCommitment: {{
+-            left: 330,
+-            top: 395,
+-            width: 620,
+-            height: 185
+-        }},
+-
+-        hotspot: {{
+-            left: 970,
+-            top: 12,
+-            width: 300,
+-            height: 300
++    // LAYOUT V5: geometry and preferences only; widget callbacks stay unchanged.
++    const LAYOUT_OWNER = {json.dumps(dashboard_layout_owner)};
++    const LAYOUT_VERSION = 5;
++    const PANEL_IDS = ['delayCommitment','enquiry','executive','delayBucket','hotspot'];
++    let currentMode = null;
++    let currentPreferences = null;
++    let currentLayout = null;
++    let gestureDepth = 0;
++    let resizeTimer = null;
++    function getParentDocument(){{ try{{return window.parent.document;}}catch(e){{return null;}} }}
++    function clamp(value,minimum,maximum){{return Math.max(minimum,Math.min(maximum,value));}}
++    function layoutMode(width){{return width>=1200?'desktop':width>760?'tablet':'mobile';}}
++    function preferenceKey(mode){{return 'npi_dashboard_v5:'+LAYOUT_OWNER+':'+mode;}}
++    function defaultLayout(width){{
++        const mode=layoutMode(width), pad=12, gap=12, inner=Math.max(1,width-pad*2);
++        const rects={{}};
++        function put(id,left,top,w,h){{rects[id]={{left,top,width:w,height:h}};}}
++        if(mode==='desktop'){{
++            const enquiry=320, bucket=240, hotspot=Math.max(320,inner*0.285);
++            put('delayCommitment',pad,pad,inner-enquiry-gap,220);
++            put('enquiry',width-pad-enquiry,pad,enquiry,220);
++            put('executive',pad,244,inner-bucket-hotspot-gap*2,350);
++            put('delayBucket',rects.executive.left+rects.executive.width+gap,244,bucket,350);
++            put('hotspot',width-pad-hotspot,244,hotspot,350);
++        }}else if(mode==='tablet'){{
++            const col=(inner-gap)/2;
++            put('delayCommitment',pad,pad,inner,180);
++            put('executive',pad,204,col,490);
++            put('hotspot',pad+col+gap,204,col,490);
++            put('delayBucket',pad,706,col,350);
++            put('enquiry',pad+col+gap,706,col,350);
++        }}else{{
++            const heights={{delayCommitment:280,executive:510,hotspot:320,delayBucket:350,enquiry:230}};
++            let top=pad;
++            ['delayCommitment','executive','hotspot','delayBucket','enquiry'].forEach(function(id){{
++                put(id,pad,top,inner,heights[id]);top+=heights[id]+gap;
++            }});
+         }}
+-
+-    }};
+-
+-
+-    /* ========================================================
+-       GENERAL HELPERS
+-       ======================================================== */
+-
+-    function getParentDocument() {{
+-
+-        try {{
+-
+-            return window.parent.document;
+-
++        const height=Math.max(...Object.values(rects).map(r=>r.top+r.height))+pad;
++        return {{mode,width,rects,height}};
++    }}
++    function overlaps(a,b){{return a.left<b.left+b.width && b.left<a.left+a.width && a.top<b.top+b.height && b.top<a.top+a.height;}}
++    function validRects(rects,width){{
++        if(!rects || !PANEL_IDS.every(id=>rects[id]))return false;
++        return PANEL_IDS.every(function(id,index){{
++            const r=rects[id];
++            return ['left','top','width','height'].every(k=>Number.isFinite(r[k])) &&
++                r.left>=0 && r.top>=0 && r.width>=Math.min(180,width-24) && r.height>=120 &&
++                r.left+r.width<=width+1 && r.top+r.height<=5000 &&
++                PANEL_IDS.slice(index+1).every(other=>!overlaps(r,rects[other]));
++        }});
++    }}
++    function readPreferences(mode){{
++        try{{
++            const stored=JSON.parse(window.parent.localStorage.getItem(preferenceKey(mode))||'null');
++            if(stored && stored.version===LAYOUT_VERSION && stored.owner===LAYOUT_OWNER && stored.mode===mode && stored.custom===true)return stored;
++        }}catch(e){{}}
++        return null;
++    }}
++    function persistPreferences(){{
++        if(!currentPreferences || !currentPreferences.custom)return;
++        try{{window.parent.localStorage.setItem(preferenceKey(currentMode),JSON.stringify(currentPreferences));}}catch(e){{}}
++    }}
++    function ensureCustom(){{
++        if(!currentPreferences)currentPreferences={{version:LAYOUT_VERSION,owner:LAYOUT_OWNER,mode:currentMode,custom:true}};
++        currentPreferences.custom=true;
++    }}
++    function publishLayout(){{
++        window.dispatchEvent(new Event('npi-dashboard-layout'));
++    }}
++    function panelFor(id){{return document.querySelector('[data-layout-id="'+id+'"]');}}
++    function paintLayout(){{
++        if(!currentLayout)return;
++        const canvas=document.getElementById('npi-layout-canvas');
++        canvas.style.height=currentLayout.height+'px';
++        PANEL_IDS.forEach(function(id){{
++            const panel=panelFor(id), r=currentLayout.rects[id];if(!panel)return;
++            Object.keys(r).forEach(key=>panel.style.setProperty(key,r[key]+'px'));
++            panel.style.resize=currentMode==='desktop' && id!=='enquiry'?'both':'none';
++        }});
++        const executive=panelFor('executive');
++        const donut=executive && executive.querySelector('.npi-floating-donut');
++        if(donut){{
++            const size=currentMode==='desktop'?Math.min(260,Math.max(180,currentLayout.rects.executive.width*0.38)):210;
++            donut.style.width=size+'px';donut.style.height=size+'px';donut.style.flexBasis=size+'px';
+         }}
+-        catch (error) {{
+-
+-            return null;
+-
++        document.getElementById('npi-floating-stage').dataset.layoutMode=currentMode;
++        publishLayout();
++    }}
++    function reflowLayout(){{
++        const scroll=document.getElementById('npi-dashboard-scroll');
++        const width=Math.max(1,scroll.clientWidth);
++        const base=defaultLayout(width), changed=base.mode!==currentMode;
++        if(changed){{currentMode=base.mode;currentPreferences=readPreferences(currentMode);}}
++        currentLayout=base;
++        const saved=currentPreferences && currentPreferences.widgets;
++        // Absolute custom geometry is restored only at the width where the user chose it.
++        // At another width use readable defaults; retain the saved preference for return.
++        if(saved && Math.abs(Number(currentPreferences.width)-width)<=2 && validRects(saved,width)){{
++            currentLayout.rects=JSON.parse(JSON.stringify(saved));
++            currentLayout.height=Math.max(...Object.values(saved).map(r=>r.top+r.height))+12;
+         }}
+-
++        DEFAULT_DASHBOARD_HEIGHT=base.height+18;
++        paintLayout();
++        applyDashboardHeight(readDashboardHeight(),false);
+     }}
+-
+-
+-    function clamp(
+-        value,
+-        minimum,
+-        maximum
+-    ) {{
+-
+-        return Math.max(
+-            minimum,
+-            Math.min(
+-                maximum,
+-                value
+-            )
+-        );
+-
++    function loadLayout(){{reflowLayout();}}
++    function saveLayout(){{
++        // Called only on completion of an explicit user gesture.
++        ensureCustom();
++        currentPreferences.width=currentLayout.width;
++        currentPreferences.widgets=JSON.parse(JSON.stringify(currentLayout.rects));
++        persistPreferences();
+     }}
+-
+-
+-    /* ========================================================
+-       LAYOUT SAVE
+-       ======================================================== */
+-
+-    function saveLayout() {{
+-
+-        try {{
+-
+-            const layout = {{}};
+-
+-            document
+-                .querySelectorAll(
+-                    ".npi-floating-panel"
+-                )
+-                .forEach(
+-                    function(panel) {{
+-
+-                        const id =
+-                            panel.dataset.layoutId;
+-
+-                        layout[id] = {{
+-
+-                            left:
+-                                panel.offsetLeft,
+-
+-                            top:
+-                                panel.offsetTop,
+-
+-                            width:
+-                                panel.offsetWidth,
+-
+-                            height:
+-                                panel.offsetHeight
+-
+-                        }};
+-
+-                    }}
+-                );
+-
+-
+-            try {{
+-
+-                localStorage.setItem(
+-                    STORAGE_KEY,
+-                    JSON.stringify(layout)
+-                );
+-
+-                return;
+-
+-            }}
+-            catch (error) {{}}
+-
+-
+-            try {{
+-
+-                window.parent.localStorage.setItem(
+-                    STORAGE_KEY,
+-                    JSON.stringify(layout)
+-                );
+-
+-            }}
+-            catch (error) {{}}
+-
++    function saveDashboardHeight(height){{
++        ensureCustom();currentPreferences.dashboardHeight=height;persistPreferences();
++    }}
++    function updatePanel(id,patch,save){{
++        if(currentMode!=='desktop' || !currentLayout.rects[id])return false;
++        const rects=JSON.parse(JSON.stringify(currentLayout.rects));
++        Object.assign(rects[id],patch);
++        if(!validRects(rects,currentLayout.width)){{paintLayout();return false;}}
++        currentLayout.rects=rects;
++        currentLayout.height=Math.max(...Object.values(rects).map(r=>r.top+r.height))+12;
++        paintLayout();if(save)saveLayout();return true;
++    }}
++    function resetLayout(){{
++        // Reset every viewport preference for this user only. Legacy data is untouched.
++        ['desktop','tablet','mobile'].forEach(function(mode){{
++            try{{window.parent.localStorage.removeItem(preferenceKey(mode));}}catch(e){{}}
++        }});
++        currentPreferences=null;currentMode=null;reflowLayout();
++    }}
++    function enableDragging(panel){{
++        const handle=panel.querySelector('[data-drag-handle]');if(!handle)return;
++        let drag=null;
++        handle.addEventListener('pointerdown',function(event){{
++            if(currentMode!=='desktop' || event.button!==0 || event.target.closest('button'))return;
++            const r=currentLayout.rects[panel.dataset.layoutId];
++            drag={{x:event.clientX,y:event.clientY,left:r.left,top:r.top}};gestureDepth++;
++            try{{handle.setPointerCapture(event.pointerId);}}catch(e){{}}event.preventDefault();
++        }});
++        handle.addEventListener('pointermove',function(event){{
++            if(!drag)return;
++            updatePanel(panel.dataset.layoutId,{{left:Math.max(0,drag.left+event.clientX-drag.x),top:Math.max(0,drag.top+event.clientY-drag.y)}},false);
++        }});
++        function finish(){{if(!drag)return;drag=null;gestureDepth=Math.max(0,gestureDepth-1);saveLayout();}}
++        handle.addEventListener('pointerup',finish);handle.addEventListener('pointercancel',finish);
++    }}
++    function enableResizeSaving(panel){{
++        let resizing=false;
++        panel.addEventListener('pointerdown',function(event){{
++            if(currentMode!=='desktop')return;
++            const r=panel.getBoundingClientRect();
++            if(event.clientX>=r.right-18 && event.clientY>=r.bottom-18){{resizing=true;gestureDepth++;}}
++        }});
++        function finish(){{
++            if(!resizing)return;resizing=false;gestureDepth=Math.max(0,gestureDepth-1);
++            updatePanel(panel.dataset.layoutId,{{width:panel.offsetWidth,height:panel.offsetHeight}},true);
+         }}
+-        catch (error) {{}}
+-
++        document.addEventListener('pointerup',finish);document.addEventListener('pointercancel',finish);
+     }}
+-
+-
+-    /* ========================================================
+-       LAYOUT LOAD
+-       ======================================================== */
+-
+-    function loadLayout() {{
+-
+-        try {{
+-
+-            let raw = null;
+-
+-
+-            try {{
+-
+-                raw =
+-                    localStorage.getItem(
+-                        STORAGE_KEY
+-                    );
+-
+-            }}
+-            catch (error) {{}}
+-
+-
+-            if (!raw) {{
+-
+-                try {{
+-
+-                    raw =
+-                        window.parent.localStorage.getItem(
+-                            STORAGE_KEY
+-                        );
+-
+-                }}
+-                catch (error) {{}}
+-
+-            }}
+-
+-
+-            if (!raw) {{
+-                return;
+-            }}
+-
+-
+-            const layout =
+-                JSON.parse(raw);
+-
+-
+-            Object.keys(layout)
+-                .forEach(
+-                    function(id) {{
+-
+-                        const panel =
+-                            document.querySelector(
+-                                '[data-layout-id="' +
+-                                id +
+-                                '"]'
+-                            );
+-
+-
+-                        if (!panel) {{
+-                            return;
+-                        }}
+-
+-
+-                        const item =
+-                            layout[id];
+-
+-
+-                        if (
+-                            Number.isFinite(
+-                                item.left
+-                            )
+-                        ) {{
+-
+-                            panel.style.left =
+-                                item.left + "px";
+-
+-                        }}
+-
+-
+-                        if (
+-                            Number.isFinite(
+-                                item.top
+-                            )
+-                        ) {{
+-
+-                            panel.style.top =
+-                                item.top + "px";
+-
+-                        }}
+-
+-
+-                        if (
+-                            Number.isFinite(
+-                                item.width
+-                            )
+-                        ) {{
+-
+-                            panel.style.width =
+-                                item.width + "px";
+-
+-                        }}
+-
+-
+-                        if (
+-                            Number.isFinite(
+-                                item.height
+-                            )
+-                        ) {{
+-
+-                            panel.style.height =
+-                                item.height + "px";
+-
+-                        }}
+-
+-                    }}
+-                );
+-
+-        }}
+-        catch (error) {{}}
+-
+-    }}
+-
+-
+-    /* ========================================================
+-       RESET
+-       ======================================================== */
+-
+-    function resetLayout() {{
+-
+-        try {{
+-
+-            localStorage.removeItem(
+-                STORAGE_KEY
+-            );
+-
+-        }}
+-        catch (error) {{}}
+-
+-
+-        try {{
+-
+-            window.parent.localStorage.removeItem(
+-                STORAGE_KEY
+-            );
+-
+-        }}
+-        catch (error) {{}}
+-
+-
+-        Object.keys(DEFAULT_LAYOUT)
+-            .forEach(
+-                function(id) {{
+-
+-                    const panel =
+-                        document.querySelector(
+-                            '[data-layout-id="' +
+-                            id +
+-                            '"]'
+-                        );
+-
+-
+-                    if (!panel) {{
+-                        return;
+-                    }}
+-
+-
+-                    const item =
+-                        DEFAULT_LAYOUT[id];
+-
+-
+-                    panel.style.left =
+-                        item.left + "px";
+-
+-                    panel.style.top =
+-                        item.top + "px";
+-
+-                    panel.style.width =
+-                        item.width + "px";
+-
+-                    panel.style.height =
+-                        item.height + "px";
+-
+-                }}
+-            );
+-
+-
+-        saveLayout();
+-        applyDashboardHeight(DEFAULT_DASHBOARD_HEIGHT, true);
+-
+-    }}
+-
+-
+-    /* ========================================================
+-       DRAGGING
+-       ======================================================== */
+-
+-    function enableDragging(panel) {{
+-
+-        const handle =
+-            panel.querySelector(
+-                "[data-drag-handle]"
+-            );
+-
+-
+-        if (!handle) {{
+-            return;
+-        }}
+-
+-
+-        let dragging = false;
+-
+-        let startX = 0;
+-        let startY = 0;
+-
+-        let startLeft = 0;
+-        let startTop = 0;
+-
+-
+-        handle.addEventListener(
+-            "pointerdown",
+-            function(event) {{
+-
+-                if (
+-                    event.target.closest(
+-                        "button"
+-                    )
+-                ) {{
+-                    return;
+-                }}
+-
+-
+-                dragging = true;
+-
+-
+-                startX =
+-                    event.clientX;
+-
+-                startY =
+-                    event.clientY;
+-
+-
+-                startLeft =
+-                    panel.offsetLeft;
+-
+-                startTop =
+-                    panel.offsetTop;
+-
+-
+-                try {{
+-
+-                    handle.setPointerCapture(
+-                        event.pointerId
+-                    );
+-
+-                }}
+-                catch (error) {{}}
+-
+-
+-                event.preventDefault();
+-
+-            }}
+-        );
+-
+-
+-        handle.addEventListener(
+-            "pointermove",
+-            function(event) {{
+-
+-                if (!dragging) {{
+-                    return;
+-                }}
+-
+-
+-                const stage =
+-                    document.getElementById(
+-                        "npi-floating-stage"
+-                    );
+-
+-
+-                if (!stage) {{
+-                    return;
+-                }}
+-
+-
+-                const dx =
+-                    event.clientX
+-                    - startX;
+-
+-
+-                const dy =
+-                    event.clientY
+-                    - startY;
+-
+-
+-                const maxLeft =
+-                    Math.max(
+-                        0,
+-                        stage.clientWidth
+-                        - panel.offsetWidth
+-                    );
+-
+-
+-                const maxTop =
+-                    Math.max(
+-                        0,
+-                        stage.clientHeight
+-                        - panel.offsetHeight
+-                    );
+-
+-
+-                panel.style.left =
+-                    clamp(
+-                        startLeft + dx,
+-                        0,
+-                        maxLeft
+-                    ) + "px";
+-
+-
+-                panel.style.top =
+-                    clamp(
+-                        startTop + dy,
+-                        0,
+-                        maxTop
+-                    ) + "px";
+-
+-            }}
+-        );
+-
+-
+-        handle.addEventListener(
+-            "pointerup",
+-            function() {{
+-
+-                dragging = false;
+-
+-                saveLayout();
+-
+-            }}
+-        );
+-
+-
+-        handle.addEventListener(
+-            "pointercancel",
+-            function() {{
+-
+-                dragging = false;
+-
+-                saveLayout();
+-
+-            }}
+-        );
+-
+-    }}
+-
+-
+-    /* ========================================================
+-       RESIZE SAVE
+-       ======================================================== */
+-
+-    function enableResizeSaving(panel) {{
+-
+-        if (
+-            typeof ResizeObserver
+-            ===
+-            "undefined"
+-        ) {{
+-            return;
+-        }}
+-
+-
+-        let lastWidth =
+-            panel.offsetWidth;
+-
+-
+-        let lastHeight =
+-            panel.offsetHeight;
+-
+-
+-        const observer =
+-            new ResizeObserver(
+-                function() {{
+-
+-                    if (
+-                        panel.offsetWidth
+-                        !==
+-                        lastWidth
+-                        ||
+-                        panel.offsetHeight
+-                        !==
+-                        lastHeight
+-                    ) {{
+-
+-                        lastWidth =
+-                            panel.offsetWidth;
+-
+-                        lastHeight =
+-                            panel.offsetHeight;
+-
+-
+-                        saveLayout();
+-
+-                    }}
+-
+-                }}
+-            );
+-
+-
+-        observer.observe(panel);
+-
+-    }}
+-
++    window.__npiDashboardLayoutV5={{owner:LAYOUT_OWNER,getLayout:()=>currentLayout,updatePanel,resetLayout,
++        beginGesture:()=>gestureDepth++,endGesture:()=>{{gestureDepth=Math.max(0,gestureDepth-1);}},sync:publishLayout}};
++    window.addEventListener('resize',function(){{
++        clearTimeout(resizeTimer);resizeTimer=setTimeout(function(){{if(!gestureDepth)reflowLayout();}},80);
++    }});
+ 
+     /* ========================================================
+        FIND STREAMLIT BRIDGE BUTTON
+@@ -4838,26 +4472,12 @@
+        RESIZABLE DASHBOARD / DRILLDOWN BOUNDARY
+        ======================================================== */
+ 
+-    const DASHBOARD_HEIGHT_KEY = "npi_control_tower_dashboard_stage_height_v2";
+-    const DEFAULT_DASHBOARD_HEIGHT = 553;
++    let DEFAULT_DASHBOARD_HEIGHT = 624;
+     const MAX_DASHBOARD_HEIGHT = 900;
+-
+-    function getDashboardMinimumHeight() {{
+-        // Keep the initial dashboard height at 553px, but let the user
+-        // drag the bottom boundary upward to 300px when they want a tighter
+-        // transition into Drilldown. The boundary is a user-controlled layout
+-        // height, so it must not be clamped to the lowest floating panel.
+-        return 300;
+-    }}
+-
++    function getDashboardMinimumHeight() {{ return 300; }}
+     function readDashboardHeight() {{
+-        let raw = null;
+-        try {{ raw = localStorage.getItem(DASHBOARD_HEIGHT_KEY); }} catch (error) {{}}
+-        if (!raw) {{
+-            try {{ raw = window.parent.localStorage.getItem(DASHBOARD_HEIGHT_KEY); }} catch (error) {{}}
+-        }}
+-        const value = Number(raw);
+-        return Number.isFinite(value) && value > 0 ? value : DEFAULT_DASHBOARD_HEIGHT;
++        const height=currentPreferences && currentPreferences.dashboardHeight;
++        return Number.isFinite(height) ? height : DEFAULT_DASHBOARD_HEIGHT;
+     }}
+ 
+     function syncDrilldownGap() {{
+@@ -4921,17 +4541,7 @@
+         const minimum = getDashboardMinimumHeight();
+         const numeric = Number(requestedHeight);
+         const wanted = Number.isFinite(numeric) ? numeric : DEFAULT_DASHBOARD_HEIGHT;
+-        const isMobileLayout = !!(window.matchMedia && window.matchMedia("(max-width: 760px)").matches);
+-        let height;
+-        if (isMobileLayout) {{
+-            // Let the mobile stack determine its full height before sizing the iframe.
+-            stage.style.setProperty("height", "auto", "important");
+-            stage.style.setProperty("min-height", "0", "important");
+-            stage.style.setProperty("max-height", "none", "important");
+-            height = Math.max(320, Math.min(1800, stage.scrollHeight + 16));
+-        }} else {{
+-            height = clamp(Math.max(wanted, minimum), minimum, MAX_DASHBOARD_HEIGHT);
+-        }}
++        const height = clamp(wanted, minimum, Math.max(MAX_DASHBOARD_HEIGHT, DEFAULT_DASHBOARD_HEIGHT));
+         stage.style.setProperty("height", height + "px", "important");
+         stage.style.setProperty("min-height", height + "px", "important");
+ 
+@@ -4982,9 +4592,9 @@
+         try {{ window.parent.setTimeout(syncDrilldownGap, 40); }} catch (error) {{}}
+ 
+         if (persist) {{
+-            try {{ localStorage.setItem(DASHBOARD_HEIGHT_KEY, String(height)); }} catch (error) {{}}
+-            try {{ window.parent.localStorage.setItem(DASHBOARD_HEIGHT_KEY, String(height)); }} catch (error) {{}}
++            saveDashboardHeight(height);
+         }}
++        publishLayout();
+         return height;
+     }}
+ 
+@@ -5090,6 +4700,14 @@
+ 
+         loadLayout();
+         setupDashboardBoundary();
++        if (typeof ResizeObserver !== "undefined") {{
++            let lastWidth=document.getElementById('npi-dashboard-scroll').clientWidth;
++            const widthObserver=new ResizeObserver(function() {{
++                const width=document.getElementById('npi-dashboard-scroll').clientWidth;
++                if(Math.abs(width-lastWidth)>1 && !gestureDepth) {{lastWidth=width;reflowLayout();}}
++            }});
++            widthObserver.observe(document.getElementById('npi-dashboard-scroll'));
++        }}
+ 
+         wireLegend();
+ 
+@@ -5150,7 +4768,7 @@
+ 
+     components.html(
+         floating_html,
+-        height=553,
++        height=624,
+         scrolling=False,
+     )
+ 
+@@ -5181,344 +4799,132 @@
+         if search_message:
+             st.caption(search_message)
+ 
+-    # Float the real Streamlit form as an absolutely-positioned child of the
+-    # shared content area. Absolute positioning lets it scroll with the page,
+-    # while its coordinates remain relative to the floating dashboard stage.
+-    # Rebind handlers on reruns so an earlier controller cannot pin the panel.
++    # Position the existing native form over its shared dashboard slot; no DOM moves.
+     components.html(
+-        """
+-        <script>
+-        (function () {
+-            try {
+-                const parentWin = window.parent;
+-                const parentDoc = parentWin.document;
+-                const CONTROLLER_KEY = "__npiEnquiryFinderFloatControllerV3";
+-                const LEGACY_KEY = "__npiEnquiryFinderFloatController";
+-                const STORAGE_KEY = "npiEnquiryFinderLayoutV1";
+-
+-                // This tiny components.html iframe only installs drag/resize listeners.
+-                // Keep its script active but take its wrapper out of page flow so it
+-                // does not add another vertical gap before the Drilldown.
+-                try {
+-                    const controllerFrame = window.frameElement;
+-                    if (controllerFrame) {
+-                        controllerFrame.style.setProperty("position", "absolute", "important");
+-                        controllerFrame.style.setProperty("left", "0px", "important");
+-                        controllerFrame.style.setProperty("top", "0px", "important");
+-                        controllerFrame.style.setProperty("width", "1px", "important");
+-                        controllerFrame.style.setProperty("height", "1px", "important");
+-                        controllerFrame.style.setProperty("min-height", "1px", "important");
+-                        controllerFrame.style.setProperty("opacity", "0", "important");
+-                        controllerFrame.style.setProperty("pointer-events", "none", "important");
+-                        let controllerBlock = controllerFrame;
+-                        while (controllerBlock && controllerBlock !== parentDoc.body) {
+-                            if (controllerBlock.getAttribute && controllerBlock.getAttribute("data-testid") === "stElementContainer") break;
+-                            controllerBlock = controllerBlock.parentElement;
+-                        }
+-                        if (controllerBlock && controllerBlock !== parentDoc.body) {
+-                            controllerBlock.style.setProperty("position", "absolute", "important");
+-                            controllerBlock.style.setProperty("left", "0px", "important");
+-                            controllerBlock.style.setProperty("top", "0px", "important");
+-                            controllerBlock.style.setProperty("width", "1px", "important");
+-                            controllerBlock.style.setProperty("height", "1px", "important");
+-                            controllerBlock.style.setProperty("min-height", "1px", "important");
+-                            controllerBlock.style.setProperty("max-height", "1px", "important");
+-                            controllerBlock.style.setProperty("margin", "0px", "important");
+-                            controllerBlock.style.setProperty("padding", "0px", "important");
+-                            controllerBlock.style.setProperty("overflow", "hidden", "important");
+-                        }
+-                    }
+-                } catch (e) {}
+-
+-                // Retire the prior fixed-position controller, whose old scroll
+-                // listeners can otherwise keep re-applying viewport coordinates.
+-                const legacy = parentWin[LEGACY_KEY];
+-                if (legacy) {
+-                    try { if (legacy.observer) legacy.observer.disconnect(); } catch (e) {}
+-                    try { if (legacy.resizeObserver) legacy.resizeObserver.disconnect(); } catch (e) {}
+-                    try { if (legacy.observerTimer) parentWin.clearTimeout(legacy.observerTimer); } catch (e) {}
+-                    legacy.container = null;
+-                    legacy.drag = null;
+-                    legacy.retired = true;
+-                }
+-
+-                function removeStoredListeners(target, handlers) {
+-                    if (!target || !handlers) return;
+-                    try { if (handlers.pointerdown) target.removeEventListener("pointerdown", handlers.pointerdown, true); } catch (e) {}
+-                    try { if (handlers.pointermove) target.removeEventListener("pointermove", handlers.pointermove, true); } catch (e) {}
+-                    try { if (handlers.pointerup) target.removeEventListener("pointerup", handlers.pointerup, true); } catch (e) {}
+-                    try { if (handlers.pointercancel) target.removeEventListener("pointercancel", handlers.pointercancel, true); } catch (e) {}
+-                    try { if (handlers.resize) parentWin.removeEventListener("resize", handlers.resize); } catch (e) {}
+-                }
+-
+-                let state = parentWin[CONTROLLER_KEY];
+-                if (!state) {
+-                    let savedLayout = null;
+-                    try { savedLayout = JSON.parse(parentWin.localStorage.getItem(STORAGE_KEY) || "null"); } catch (e) {}
+-                    const defaults = { left: 12, top: 5, width: 282, height: 190 };
+-                    const layout = Object.assign({}, defaults, savedLayout || {});
+-                    ["left", "top", "width", "height"].forEach(function (key) {
+-                        const value = Number(layout[key]);
+-                        layout[key] = Number.isFinite(value) ? value : defaults[key];
+-                    });
+-                    state = {
+-                        layout: layout,
+-                        container: null,
+-                        drag: null,
+-                        observer: null,
+-                        observerTimer: null,
+-                        resizeObserver: null,
+-                        saveTimer: null,
+-                        listenerDocument: null,
+-                        handlers: null
+-                    };
+-                    parentWin[CONTROLLER_KEY] = state;
+-                }
+-
+-                // components.html may execute again while the parent document
+-                // remains alive. Remove this controller's old handlers and
+-                // observers before binding handlers to the current app DOM.
+-                removeStoredListeners(state.listenerDocument, state.handlers);
+-                try { if (state.observer) state.observer.disconnect(); } catch (e) {}
+-                try { if (state.resizeObserver) state.resizeObserver.disconnect(); } catch (e) {}
+-                try { if (state.observerTimer) parentWin.clearTimeout(state.observerTimer); } catch (e) {}
+-                state.observer = null;
+-                state.resizeObserver = null;
+-                state.drag = null;
+-                state.listenerDocument = parentDoc;
+-                state.handlers = null;
+-
+-                function getDashboardFrame() {
+-                    const frames = parentDoc.querySelectorAll("iframe");
+-                    for (const frame of frames) {
+-                        try {
+-                            if (frame.contentDocument && frame.contentDocument.getElementById("npi-floating-stage")) return frame;
+-                        } catch (e) {}
+-                    }
+-                    return null;
+-                }
+-
+-                function getPanel() {
+-                    return parentDoc.querySelector('div[class*="st-key-npi_enquiry_search_section"]');
+-                }
+-
+-                function collapseOriginalFinderFlow(panel) {
+-                    if (!panel) return;
+-                    let node = panel;
+-                    for (let depth = 0; node && node !== parentDoc.body && depth < 12; depth++, node = node.parentElement) {
+-                        if (node.getAttribute && node.getAttribute("data-testid") === "stElementContainer") {
+-                            // Keep the native form DOM alive for Streamlit callbacks but remove its
+-                            // old placeholder height from normal page flow. The panel itself is
+-                            // absolutely positioned over the floating dashboard by positionPanel().
+-                            node.style.setProperty("display", "contents", "important");
+-                            node.style.setProperty("height", "0px", "important");
+-                            node.style.setProperty("min-height", "0px", "important");
+-                            node.style.setProperty("margin", "0px", "important");
+-                            node.style.setProperty("padding", "0px", "important");
+-                            node.style.setProperty("overflow", "visible", "important");
+-                            return;
+-                        }
+-                    }
+-                }
+-
+-                function findSharedRoot(frame, panel) {
+-                    let candidate = panel;
+-                    while (candidate && candidate !== parentDoc.body) {
+-                        if (candidate.contains(frame)) return candidate;
+-                        candidate = candidate.parentElement;
+-                    }
+-                    return parentDoc.querySelector('[data-testid="stMainBlockContainer"]') || parentDoc.body;
+-                }
+-
+-                function getMetrics(panel) {
+-                    const frame = getDashboardFrame();
+-                    if (!frame || !panel) return null;
+-                    let stage = null;
+-                    try { stage = frame.contentDocument.getElementById("npi-floating-stage"); } catch (e) {}
+-                    if (!stage) return null;
+-                    const frameRect = frame.getBoundingClientRect();
+-                    const stageRect = stage.getBoundingClientRect();
+-                    const sharedRoot = findSharedRoot(frame, panel);
+-                    if (sharedRoot && sharedRoot !== parentDoc.body) {
+-                        try {
+-                            if (parentWin.getComputedStyle(sharedRoot).position === "static") {
+-                                sharedRoot.style.setProperty("position", "relative", "important");
+-                            }
+-                        } catch (e) {}
+-                    }
+-                    return {
+-                        frame: frame,
+-                        frameRect: frameRect,
+-                        stageRect: stageRect,
+-                        root: sharedRoot,
+-                        width: Math.max(1, stage.clientWidth || frame.clientWidth || stageRect.width),
+-                        height: Math.max(1, stage.clientHeight || 455)
+-                    };
+-                }
+-
+-                function clamp(value, minimum, maximum) {
+-                    return Math.max(minimum, Math.min(maximum, value));
+-                }
+-
+-                function saveLayout() {
+-                    try {
+-                        if (state.saveTimer) parentWin.clearTimeout(state.saveTimer);
+-                        state.saveTimer = parentWin.setTimeout(function () {
+-                            try { parentWin.localStorage.setItem(STORAGE_KEY, JSON.stringify(state.layout)); } catch (e) {}
+-                        }, 120);
+-                    } catch (e) {}
+-                }
+-
+-                function positionPanel(panel) {
+-                    const metrics = getMetrics(panel);
+-                    if (!metrics || !panel) return false;
+-                    const width = Math.min(state.layout.width, metrics.width);
+-                    const height = Math.min(state.layout.height, metrics.height);
+-                    state.layout.width = Math.max(250, width);
+-                    state.layout.height = Math.max(160, height);
+-                    state.layout.left = clamp(state.layout.left, 0, Math.max(0, metrics.width - state.layout.width));
+-                    state.layout.top = clamp(state.layout.top, 0, Math.max(0, metrics.height - state.layout.height));
+-
+-                    // Use the actual offset parent as the positioning coordinate
+-                    // system. The panel is absolute, not fixed, so normal page
+-                    // scrolling moves it together with the dashboard content.
+-                    panel.style.setProperty("position", "absolute", "important");
+-                    const offsetParent = panel.offsetParent || metrics.root || parentDoc.body;
+-                    const parentRect = offsetParent.getBoundingClientRect();
+-                    const left = metrics.frameRect.left + metrics.stageRect.left - parentRect.left
+-                        + (offsetParent.scrollLeft || 0) - (offsetParent.clientLeft || 0) + state.layout.left;
+-                    const top = metrics.frameRect.top + metrics.stageRect.top - parentRect.top
+-                        + (offsetParent.scrollTop || 0) - (offsetParent.clientTop || 0) + state.layout.top;
+-
+-                    panel.style.setProperty("left", left + "px", "important");
+-                    panel.style.setProperty("top", top + "px", "important");
+-                    panel.style.setProperty("width", state.layout.width + "px", "important");
+-                    panel.style.setProperty("height", state.layout.height + "px", "important");
+-                    panel.style.setProperty("min-width", "250px", "important");
+-                    panel.style.setProperty("min-height", "160px", "important");
+-                    panel.style.setProperty("max-width", Math.max(250, metrics.width - state.layout.left) + "px", "important");
+-                    panel.style.setProperty("max-height", Math.max(160, metrics.height - state.layout.top) + "px", "important");
+-                    panel.style.setProperty("overflow", "auto", "important");
+-                    panel.style.setProperty("resize", "both", "important");
+-                    panel.style.setProperty("z-index", "2147483000", "important");
+-                    panel.style.setProperty("box-sizing", "border-box", "important");
+-                    panel.style.setProperty("background", "#FFFFFF", "important");
+-                    panel.style.setProperty("border", "1px solid #C9CDD3", "important");
+-                    panel.style.setProperty("border-radius", "8px", "important");
+-                    panel.style.setProperty("box-shadow", "0 2px 8px rgba(0,0,0,0.18)", "important");
+-                    panel.style.setProperty("padding", "8px", "important");
+-
+-                    panel.querySelectorAll('[data-testid="stVerticalBlock"]').forEach(function (block) {
+-                        block.style.setProperty("gap", "0.3rem", "important");
+-                    });
+-                    const heading = panel.querySelector("h3");
+-                    if (heading) {
+-                        heading.style.setProperty("cursor", state.drag ? "grabbing" : "grab", "important");
+-                        heading.style.setProperty("user-select", "none", "important");
+-                        heading.style.setProperty("touch-action", "none", "important");
+-                        heading.style.setProperty("font-size", "13px", "important");
+-                        heading.style.setProperty("line-height", "18px", "important");
+-                        heading.style.setProperty("margin", "-8px -8px 4px -8px", "important");
+-                        heading.style.setProperty("padding", "7px 9px", "important");
+-                        heading.style.setProperty("background", "#EEF0F2", "important");
+-                        heading.style.setProperty("border-bottom", "1px solid #D6D9DD", "important");
+-                    }
+-                    return true;
+-                }
+-
+-                function ensurePanel() {
+-                    const panel = getPanel();
+-                    if (!panel) return;
+-                    collapseOriginalFinderFlow(panel);
+-                    if (state.container !== panel) {
+-                        try { if (state.resizeObserver) state.resizeObserver.disconnect(); } catch (e) {}
+-                        state.resizeObserver = null;
+-                        state.container = panel;
+-                    }
+-                    if (!state.drag) positionPanel(panel);
+-                    if (!state.resizeObserver && parentWin.ResizeObserver) {
+-                        state.resizeObserver = new parentWin.ResizeObserver(function () {
+-                            if (!state.container || state.drag) return;
+-                            const rect = state.container.getBoundingClientRect();
+-                            const width = Math.round(rect.width);
+-                            const height = Math.round(rect.height);
+-                            if (width >= 250 && Math.abs(width - state.layout.width) > 2) state.layout.width = width;
+-                            if (height >= 160 && Math.abs(height - state.layout.height) > 2) state.layout.height = height;
+-                            saveLayout();
+-                            positionPanel(state.container);
+-                        });
+-                        state.resizeObserver.observe(panel);
+-                    }
+-                }
+-
+-                const handlers = {
+-                    pointerdown: function (event) {
+-                        if (event.button !== undefined && event.button !== 0) return;
+-                        const target = event.target && event.target.nodeType === 1 ? event.target : null;
+-                        const panel = state.container || getPanel();
+-                        if (!target || !panel || !panel.contains(target)) return;
+-                        const heading = target.closest("h3");
+-                        if (!heading || !panel.contains(heading)) return;
+-                        const metrics = getMetrics(panel);
+-                        if (!metrics) return;
+-                        state.drag = {
+-                            startX: event.clientX,
+-                            startY: event.clientY,
+-                            startLeft: state.layout.left,
+-                            startTop: state.layout.top,
+-                            pointerId: event.pointerId
+-                        };
+-                        heading.style.setProperty("cursor", "grabbing", "important");
+-                        try { event.preventDefault(); } catch (e) {}
+-                    },
+-                    pointermove: function (event) {
+-                        if (!state.drag) return;
+-                        const panel = state.container || getPanel();
+-                        const metrics = getMetrics(panel);
+-                        if (!metrics) return;
+-                        state.layout.left = clamp(state.drag.startLeft + event.clientX - state.drag.startX, 0, Math.max(0, metrics.width - state.layout.width));
+-                        state.layout.top = clamp(state.drag.startTop + event.clientY - state.drag.startY, 0, Math.max(0, metrics.height - state.layout.height));
+-                        if (panel) positionPanel(panel);
+-                    },
+-                    pointerup: function () {
+-                        if (!state.drag) return;
+-                        state.drag = null;
+-                        saveLayout();
+-                        if (state.container) positionPanel(state.container);
+-                    },
+-                    pointercancel: function () {
+-                        if (!state.drag) return;
+-                        state.drag = null;
+-                        saveLayout();
+-                        if (state.container) positionPanel(state.container);
+-                    },
+-                    resize: function () {
+-                        if (state.container && !state.drag) positionPanel(state.container);
+-                    }
+-                };
+-                state.handlers = handlers;
+-                state.listenerDocument = parentDoc;
+-                parentDoc.addEventListener("pointerdown", handlers.pointerdown, true);
+-                parentDoc.addEventListener("pointermove", handlers.pointermove, true);
+-                parentDoc.addEventListener("pointerup", handlers.pointerup, true);
+-                parentDoc.addEventListener("pointercancel", handlers.pointercancel, true);
+-                parentWin.addEventListener("resize", handlers.resize);
+-
+-                ensurePanel();
+-                state.observer = new parentWin.MutationObserver(function () {
+-                    if (state.observerTimer) parentWin.clearTimeout(state.observerTimer);
+-                    state.observerTimer = parentWin.setTimeout(ensurePanel, 80);
+-                });
+-                state.observer.observe(parentDoc.body, { childList: true, subtree: true });
+-                [100, 300, 700, 1200].forEach(function (delay) {
+-                    parentWin.setTimeout(ensurePanel, delay);
+-                });
+-            } catch (error) {
+-                // The normal native Streamlit form remains available if floating setup fails.
+-            }
+-        })();
+-        </script>
+-        """,
++        f"""<script>
++(function(){{
++    const parentWin=window.parent, parentDoc=parentWin.document, owner={json.dumps(dashboard_layout_owner)};
++    const KEY='__npiEnquiryLayoutV5';
++    const previous=parentWin[KEY];if(previous && previous.dispose)previous.dispose();
++    // Retire old live controllers as well as ignoring their localStorage records.
++    ['__npiEnquiryFinderFloatControllerV3','__npiEnquiryFinderFloatController'].forEach(function(key){{
++        const old=parentWin[key];if(!old)return;
++        try{{if(old.observer)old.observer.disconnect();if(old.resizeObserver)old.resizeObserver.disconnect();}}catch(e){{}}
++        ['observerTimer','saveTimer'].forEach(name=>{{try{{if(old[name])parentWin.clearTimeout(old[name]);}}catch(e){{}}}});
++        if(old.handlers)Object.entries(old.handlers).forEach(function(entry){{
++            try{{(entry[0]==='resize'?parentWin:old.listenerDocument).removeEventListener(entry[0],entry[1],entry[0]==='resize'?false:true);}}catch(e){{}}
++        }});
++        old.retired=true;old.container=null;parentWin[key]=null;
++    }});
++    let panel=null,frame=null,api=null,drag=null,resizing=null,observer=null,raf=null,disposed=false;
++    const removals=[];
++    function listen(target,type,fn,options){{target.addEventListener(type,fn,options);removals.push(()=>target.removeEventListener(type,fn,options));}}
++    function schedule(){{if(disposed || raf)return;raf=parentWin.requestAnimationFrame(function(){{
++        raf=null;
++        try{{sync();}}catch(e){{
++            // Preserve the real native form if frontend geometry changes unexpectedly.
++            if(panel){{
++                panel.style.cssText='';
++                let node=panel;
++                while(node && node!==parentDoc.body){{
++                    if(node.getAttribute && node.getAttribute('data-testid')==='stElementContainer'){{node.style.cssText='';break;}}
++                    node=node.parentElement;
++                }}
++            }}
++        }}
++    }});}}
++    function sync(){{
++        if(disposed || drag || resizing)return;
++        panel=parentDoc.querySelector('div[class*="st-key-npi_enquiry_search_section"]');
++        if(!panel)return;
++        frame=Array.from(parentDoc.querySelectorAll('iframe')).find(function(item){{
++            try{{return item.contentWindow.__npiDashboardLayoutV5 && item.contentWindow.__npiDashboardLayoutV5.owner===owner;}}catch(e){{return false;}}
++        }});
++        if(!frame){{panel.style.setProperty('visibility','hidden');return;}}
++        const next=frame.contentWindow.__npiDashboardLayoutV5;
++        if(api!==next){{
++            api=next;
++            listen(frame.contentWindow,'npi-dashboard-layout',schedule);
++            listen(frame.contentDocument.getElementById('npi-dashboard-scroll'),'scroll',schedule,{{passive:true}});
++        }}
++        const slot=frame.contentDocument.querySelector('[data-layout-id="enquiry"]');
++        if(!slot)return;
++        let block=panel;
++        while(block && block!==parentDoc.body){{
++            if(block.getAttribute && block.getAttribute('data-testid')==='stElementContainer'){{
++                Object.assign(block.style,{{display:'contents',height:'0px',minHeight:'0px',margin:'0px',padding:'0px',overflow:'visible'}});break;
++            }}block=block.parentElement;
++        }}
++        panel.style.position='absolute';
++        const offset=panel.offsetParent || parentDoc.body;
++        const base=offset.getBoundingClientRect(),fr=frame.getBoundingClientRect(),r=slot.getBoundingClientRect();
++        const view=frame.contentDocument.getElementById('npi-dashboard-scroll').getBoundingClientRect();
++        const top=fr.top+r.top,left=fr.left+r.left;
++        const clipTop=Math.max(0,view.top-r.top),clipBottom=Math.max(0,r.bottom-view.bottom);
++        const clipLeft=Math.max(0,view.left-r.left),clipRight=Math.max(0,r.right-view.right);
++        const visible=clipTop+clipBottom<r.height && clipLeft+clipRight<r.width;
++        const desktop=api.getLayout().mode==='desktop';
++        Object.assign(panel.style,{{
++            left:(left-base.left+offset.scrollLeft-offset.clientLeft)+'px',
++            top:(top-base.top+offset.scrollTop-offset.clientTop)+'px',width:r.width+'px',height:r.height+'px',
++            minWidth:'0px',minHeight:'0px',maxWidth:'none',maxHeight:'none',boxSizing:'border-box',
++            padding:'10px',background:'#fff',border:'1px solid #d8e2ed',borderRadius:'12px',
++            boxShadow:'0 3px 10px rgba(25,48,76,.07)',overflow:'auto',resize:desktop?'both':'none',
++            zIndex:'100',visibility:visible?'visible':'hidden',
++            clipPath:'inset('+clipTop+'px '+clipRight+'px '+clipBottom+'px '+clipLeft+'px)'
++        }});
++        const heading=panel.querySelector('h3');
++        if(heading)Object.assign(heading.style,{{fontFamily:'Arial,Helvetica,sans-serif',fontSize:'12px',lineHeight:'18px',fontWeight:'800',
++            margin:'-10px -10px 8px',padding:'10px 12px',background:'#20354f',color:'#fff',borderBottom:'1px solid #d8e2ed',
++            cursor:desktop?'grab':'default',touchAction:desktop?'none':'auto',userSelect:'none'}});
++        panel.querySelectorAll('[data-testid="stVerticalBlock"]').forEach(block=>block.style.gap='.3rem');
++    }}
++    listen(parentDoc,'pointerdown',function(event){{
++        if(!panel || !api || api.getLayout().mode!=='desktop' || event.button!==0 || !panel.contains(event.target))return;
++        const r=panel.getBoundingClientRect();
++        if(event.clientX>=r.right-18 && event.clientY>=r.bottom-18){{resizing=true;api.beginGesture();return;}}
++        if(!event.target.closest('h3'))return;
++        const original=api.getLayout().rects.enquiry;
++        drag={{x:event.clientX,y:event.clientY,left:original.left,top:original.top}};api.beginGesture();
++        try{{event.target.closest('h3').setPointerCapture(event.pointerId);}}catch(e){{}}event.preventDefault();
++    }},true);
++    listen(parentDoc,'pointermove',function(event){{
++        if(!drag)return;
++        api.updatePanel('enquiry',{{left:Math.max(0,drag.left+event.clientX-drag.x),top:Math.max(0,drag.top+event.clientY-drag.y)}},false);
++        // Temporarily release the sync guard to follow the shared slot.
++        const keep=drag;drag=null;sync();drag=keep;
++    }},true);
++    function finish(){{
++        if(!api || (!drag && !resizing))return;
++        const patch=resizing?{{width:panel.offsetWidth,height:panel.offsetHeight}}:{{}};
++        drag=null;resizing=null;api.endGesture();api.updatePanel('enquiry',patch,true);schedule();
++    }}
++    listen(parentDoc,'pointerup',finish,true);listen(parentDoc,'pointercancel',finish,true);
++    listen(parentWin,'resize',schedule);listen(parentWin,'scroll',schedule,{{capture:true,passive:true}});
++    listen(parentDoc,'wheel',function(event){{
++        if(!panel || !frame || !panel.contains(event.target))return;
++        const target=event.target.closest('textarea');
++        function canScroll(element){{return element && ((event.deltaY>0 && element.scrollTop+element.clientHeight<element.scrollHeight-1) || (event.deltaY<0 && element.scrollTop>0));}}
++        if(canScroll(target) || canScroll(panel))return;
++        const scroll=frame.contentDocument.getElementById('npi-dashboard-scroll');
++        if(scroll.scrollHeight>scroll.clientHeight){{scroll.scrollTop+=event.deltaY;event.preventDefault();schedule();}}
++    }},{{passive:false}});
++    observer=new parentWin.MutationObserver(schedule);observer.observe(parentDoc.body,{{childList:true,subtree:true}});
++    const timers=[0,100,300,700,1200].map(delay=>parentWin.setTimeout(schedule,delay));
++    parentWin[KEY]={{owner,dispose:function(){{disposed=true;removals.forEach(fn=>fn());observer.disconnect();timers.forEach(t=>parentWin.clearTimeout(t));if(raf)parentWin.cancelAnimationFrame(raf);}}}};
++    // The installer itself must not reserve space in the page flow.
++    try{{
++        const installer=window.frameElement;installer.style.cssText='position:absolute;width:1px;height:1px;opacity:0;pointer-events:none';
++        let block=installer;while(block && block!==parentDoc.body){{
++            if(block.getAttribute && block.getAttribute('data-testid')==='stElementContainer'){{
++                block.style.cssText='position:absolute;width:1px;height:1px;min-height:0;margin:0;padding:0;overflow:hidden';break;
++            }}block=block.parentElement;
++        }}
++    }}catch(e){{}}
++    schedule();
++}})();
++
++        </script>""",
+         height=1,
+         scrolling=False,
+     )

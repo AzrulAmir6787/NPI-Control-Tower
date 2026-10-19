@@ -1,0 +1,50 @@
+PASS: all Python files compile; locked baseline package and source files verified unchanged
+PASS: auth, Part Detail, Drilldown and business functions structurally identical; native Enquiry form/callbacks and all widget interaction wiring unchanged
+PASS: only app.py runtime source changed; protected modules and Drilldown component byte-identical
+PASS: actual dashboard and native installer JavaScript syntax
+PASS: all five widgets fit without overlap at 11 widths, with desktop/tablet/mobile breakpoints
+PASS: dominant top commitment, top-right enquiry and bottom-right hotspot; defaults do not save preferences
+PASS: boundary min300 and scroll canvas remain; user B cannot load user A preference
+PASS: tablet content sets a readable default; viewport-specific boundary preferences restore independently
+PASS: explicit custom resize persists, overlap rejected; another width uses safe defaults
+PASS: Reset clears all five widget/boundary preferences across modes for current user; legacy data untouched
+PASS: mobile natural height avoids clipping; order correct; reset extends to tablet
+PASS: native form kept in place; overlay coordinates include frame, offset parent, borders and scrolling
+PASS: dashboard scrolling clips/hides enquiry overlay before it can cover boundary or Drilldown
+PASS: rerun disposes old handlers and observers instead of accumulating controllers
+PASS: other-account frame rejected; account switch finds matching owner; mobile disables resize
+test_ab_cd_edit_a_latest_and_previous (__main__.FreshnessTests.test_ab_cd_edit_a_latest_and_previous) ... ok
+test_empty_batch_does_not_rerun (__main__.FreshnessTests.test_empty_batch_does_not_rerun) ... ok
+test_failure_does_not_report_success_or_rerun (__main__.FreshnessTests.test_failure_does_not_report_success_or_rerun) ... ok
+test_popup_single_record_payload (__main__.FreshnessTests.test_popup_single_record_payload) ... ok
+test_unrelated_event_ignored (__main__.FreshnessTests.test_unrelated_event_ignored) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.004s
+
+OK
+test_definite_access_failure_then_fresh_retry (__main__.PopupTests.test_definite_access_failure_then_fresh_retry) ... ok
+test_empty_part_fails_without_rpc (__main__.PopupTests.test_empty_part_fails_without_rpc) ... ok
+test_four_consecutive_saves_and_old_replays (__main__.PopupTests.test_four_consecutive_saves_and_old_replays) ... ok
+test_in_progress_ledger_prevents_reentrant_write (__main__.PopupTests.test_in_progress_ledger_prevents_reentrant_write) ... ok
+test_other_bridge_ignored_and_other_part_unmodified (__main__.PopupTests.test_other_bridge_ignored_and_other_part_unmodified) ... ok
+test_timeout_before_or_after_commit_never_retries_rpc (__main__.PopupTests.test_timeout_before_or_after_commit_never_retries_rpc) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.000s
+
+OK
+PASS: 4 consecutive popup saves with iframe replacement; fresh IDs; server-only Saved; scroll retained
+PASS: stale/unmatched acknowledgments cannot overwrite current popup
+PASS: lost-ack retry reuses ID; cached uncertain outcome does not resend write or show Saved
+PASS: definite no-write failure permits fresh retry
+PASS: simultaneous popup requests are queued until prior server outcome
+PASS: popup BroadcastChannel fallback receives correlated server acknowledgment
+LIMIT: simulated VM contexts and DOM; actual popup lifecycle, browser delivery and Supabase not exercised
+PASS: changed Latest HTML restores vertical/horizontal and inner document scroll
+PASS: unchanged HTML leaves live inputs and scroll untouched
+PASS: successive pre-save/post-save renders retain pending snapshot
+PASS: page navigation resets even if HTML is identical
+PASS: filter/customer change discards pending old-view scroll
+PASS: BroadcastChannel popup and normal save forwarding unchanged
+LIMIT: simulated geometry/DOM/storage and fake persistence; no real browser, live Streamlit/Supabase, physical mobile/tablet or export validation.

@@ -6,18 +6,94 @@
 (function(){
   const frame=document.getElementById('content');
   let lastHtml='';
+  let viewportKey=null;
+  let pendingViewport=null;
+  function captureViewport(){
+    try {
+      const doc=frame.contentDocument;
+      const root=doc && doc.querySelector('.npi-drilldown-wrap');
+      if(!root) return null;
+      const scrolling=doc.scrollingElement;
+      return {top:root.scrollTop,left:root.scrollLeft,
+        documentTop:scrolling ? scrolling.scrollTop : 0,
+        documentLeft:scrolling ? scrolling.scrollLeft : 0};
+    } catch(e) { return null; }
+  }
+  frame.addEventListener('load',function(){
+    const saved=pendingViewport;
+    pendingViewport=null;
+    if(!saved) return;
+    try {
+      const doc=frame.contentDocument;
+      const root=doc && doc.querySelector('.npi-drilldown-wrap');
+      if(root){root.scrollTop=saved.top;root.scrollLeft=saved.left;}
+      frame.contentWindow.scrollTo(saved.documentLeft,saved.documentTop);
+    } catch(e) {}
+  });
   function send(type, extra){ window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*'); }
-  function forwardCommitment(data){
-    if(data && data.type==='npi_commitment_save' && data.payload && typeof data.payload==='object'){
+  let bridgeId=null;
+  let channel=null;
+  let activeRequest=null;
+  const queue=[];
+  const queuedIds=new Set();
+  const results=new Map();
+  const popupTargets=new Map();
+  function publish(result){
+    const target=popupTargets.get(result.popup_id);
+    try { if(target && !target.closed) target.postMessage(result,'*'); } catch(e) {}
+    try { if(channel) channel.postMessage(result); } catch(e) {}
+  }
+  function flush(){
+    if(activeRequest || !queue.length) return;
+    activeRequest=queue.shift();
+    send('streamlit:setComponentValue',{value:activeRequest,dataType:'json'});
+  }
+  function forwardCommitment(data, source){
+    if(!data || data.type!=='npi_commitment_save' || !data.payload || typeof data.payload!=='object') return;
+    const payload=data.payload;
+    if(!payload.popup_id){
+      // Preserve the existing Drilldown batch bridge.
       send('streamlit:setComponentValue',{value:data,dataType:'json'});
+      return;
     }
+    if(!bridgeId || payload.bridge_id!==bridgeId || !payload.request_id) return;
+    if(source) popupTargets.set(payload.popup_id,source);
+    const result=results.get(payload.request_id);
+    if(result){ if(result.popup_id===payload.popup_id) publish(result); return; }
+    if(queuedIds.has(payload.request_id)){
+      // A confirmation retry may recover a lost component delivery. Its request
+      // ID is unchanged, so the server ledger still prevents another write.
+      if(activeRequest && activeRequest.payload.request_id===payload.request_id &&
+          Number(data.delivery_attempt)>Number(activeRequest.delivery_attempt || 0)){
+        activeRequest=data;
+        send('streamlit:setComponentValue',{value:data,dataType:'json'});
+      }
+      return;
+    }
+    queuedIds.add(payload.request_id);
+    queue.push(data);
+    flush();
   }
   function render(event){
     const d=event.data||{}; const args=d.args||{};
     if(d.type!=='streamlit:render') return;
-    // Do not reload the inner table when HTML is unchanged. This keeps its scroll
-    // position and all in-progress inputs intact after a successful batch save.
-    if(typeof args.html_content==='string' && args.html_content!==lastHtml){
+    bridgeId=args.popup_bridge_id || null;
+    (Array.isArray(args.popup_results) ? args.popup_results : []).forEach(function(result){
+      if(!result || result.bridge_id!==bridgeId || !result.request_id) return;
+      results.set(result.request_id,result);
+      publish(result);
+      if(activeRequest && activeRequest.payload.request_id===result.request_id){
+        activeRequest=null;
+      }
+    });
+    flush();
+    // Fresh commitment HTML must load; retain scroll only in the same view.
+    const nextKey=typeof args.viewport_key==='string' ? args.viewport_key : null;
+    const sameView=nextKey!==null && nextKey===viewportKey;
+    const changedView=!sameView;
+    if(typeof args.html_content==='string' && (args.html_content!==lastHtml || changedView)){
+      pendingViewport=sameView ? (pendingViewport || captureViewport()) : null;
+      viewportKey=nextKey;
       lastHtml=args.html_content;
       frame.srcdoc=lastHtml;
     }
@@ -28,10 +104,10 @@
   window.addEventListener('message',function(event){
     const d=event.data||{};
     if(d.type==='streamlit:render'){render(event);return;}
-    if(d.type==='npi_commitment_save') forwardCommitment(d);
+    if(d.type==='npi_commitment_save') forwardCommitment(d,event.source);
   });
   if('BroadcastChannel' in window){
-    try { const channel=new BroadcastChannel('npi_commitment_channel'); channel.addEventListener('message',function(event){forwardCommitment(event.data||{});}); } catch(e) {}
+    try { channel=new BroadcastChannel('npi_commitment_channel'); channel.addEventListener('message',function(event){forwardCommitment(event.data||{});}); } catch(e) {}
   }
   send('streamlit:componentReady',{apiVersion:1});
   send('streamlit:setFrameHeight',{height:760});

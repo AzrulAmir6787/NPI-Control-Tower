@@ -2726,6 +2726,11 @@ def render_executive_status(
     # 7. FLOATING HTML
     # ============================================================
 
+    # Opaque, stable per-account layout namespace; auth/access code is unchanged.
+    dashboard_layout_owner = hashlib.sha256(
+        ("npi-dashboard-layout-v5:" + str(st.session_state.get("npi_user_id", ""))).encode("utf-8")
+    ).hexdigest()[:32]
+
     floating_html = f"""
 <style>
 
@@ -3626,13 +3631,46 @@ body {{
     border-radius: 999px;
 }}
 
+/* Standardized layout V5. Geometry is shared with the native Enquiry form. */
+.npi-floating-stage {{ height:624px; overflow:hidden; }}
+#npi-dashboard-scroll {{ position:absolute; inset:0 0 18px; overflow:auto; scrollbar-gutter:stable; overscroll-behavior:contain; }}
+#npi-layout-canvas {{ position:relative; width:100%; min-height:1px; }}
+.npi-floating-panel {{ min-width:0; min-height:120px; border:1px solid #d8e2ed; border-radius:12px; box-shadow:0 3px 10px rgba(25,48,76,.07); }}
+.npi-enquiry-slot {{ position:absolute; pointer-events:none; }}
+.npi-floating-header {{ height:38px; padding:0 12px; background:#20354f; color:#fff; font:800 12px Arial,Helvetica,sans-serif; letter-spacing:.35px; border-bottom:1px solid #d8e2ed; }}
+.npi-executive-subtitle {{ color:#d6e3ef; font-size:10px; }}
+.npi-floating-reset {{ font-size:9px; padding:4px 6px; }}
+.npi-floating-legend {{ flex:1 1 0; width:0; min-width:0; }}
+.npi-float-legend {{ font-family:Arial,Helvetica,sans-serif; font-size:11px; }}
+.npi-float-label {{ flex:1 1 auto; min-width:0; white-space:normal; margin-right:6px; overflow-wrap:anywhere; }}
+.npi-floating-donut svg {{ display:block; width:100%; height:100%; }}
+.npi-executive-floating-content {{ overflow:auto; }}
+#npi-delay-commitment-panel {{ border-color:#d5aeb2; }}
+#npi-delay-commitment-panel .npi-commitment-count {{ font-size:28px; }}
+#npi-delay-bucket-panel .npi-delay-bucket-label {{ font-size:10px; }}
+#npi-delay-bucket-panel .npi-delay-bucket-count {{ font-size:24px; }}
+#npi-hotspot-panel .npi-hotspot-row {{ min-height:34px; }}
+#npi-hotspot-panel .npi-hotspot-operation {{ white-space:normal; overflow-wrap:anywhere; }}
+.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-floating-panel {{ resize:none !important; }}
+.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-floating-header {{ cursor:default; }}
+.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-executive-floating-inner {{ flex-direction:column; gap:10px; }}
+.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-floating-legend {{ flex:0 0 auto; width:100%; }}
+.npi-floating-stage:not([data-layout-mode="desktop"]) .npi-floating-panel button {{ min-height:38px; }}
+.npi-floating-stage[data-layout-mode="mobile"] #npi-delay-commitment-panel .npi-delay-commitment-content {{ grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:repeat(2,minmax(0,1fr)); }}
+.npi-floating-stage[data-layout-mode="mobile"] .npi-floating-header {{ font-size:11px; }}
+.npi-floating-stage[data-layout-mode="mobile"] .npi-floating-panel button {{ min-height:42px; touch-action:manipulation; }}
+.npi-floating-stage[data-layout-mode="mobile"] .npi-float-legend {{ min-height:38px; }}
+
+
 </style>
 
 
 <div
     class="npi-floating-stage"
     id="npi-floating-stage"
+    data-layout-owner="{dashboard_layout_owner}"
 >
+<div id="npi-dashboard-scroll"><div id="npi-layout-canvas">
 
     <!-- ========================================================
          PART DELAY DAYS BUCKET
@@ -3749,6 +3787,8 @@ body {{
         </div>
     </div>
 
+    <div class="npi-enquiry-slot" data-layout-id="enquiry" aria-hidden="true"></div>
+</div></div>
     <div id="npi-dashboard-drilldown-boundary"
          class="npi-dashboard-drilldown-boundary"
          role="separator"
@@ -3769,561 +3809,173 @@ body {{
        STORAGE
        ======================================================== */
 
-    const STORAGE_KEY =
-        "npi_control_tower_top01_layout_v2";
-
-
-    const DEFAULT_LAYOUT = {{
-
-
-        executive: {{
-            left: 300,
-            top: 12,
-            width: 650,
-            height: 370
-        }},
-
-        delayBucket: {{
-            left: 12,
-            top: 200,
-            width: 270,
-            height: 245
-        }},
-
-        delayCommitment: {{
-            left: 330,
-            top: 395,
-            width: 620,
-            height: 185
-        }},
-
-        hotspot: {{
-            left: 970,
-            top: 12,
-            width: 300,
-            height: 300
+    // LAYOUT V5: geometry and preferences only; widget callbacks stay unchanged.
+    const LAYOUT_OWNER = {json.dumps(dashboard_layout_owner)};
+    const LAYOUT_VERSION = 5;
+    const PANEL_IDS = ['delayCommitment','enquiry','executive','delayBucket','hotspot'];
+    let currentMode = null;
+    let currentPreferences = null;
+    let currentLayout = null;
+    let gestureDepth = 0;
+    let resizeTimer = null;
+    function getParentDocument(){{ try{{return window.parent.document;}}catch(e){{return null;}} }}
+    function clamp(value,minimum,maximum){{return Math.max(minimum,Math.min(maximum,value));}}
+    function layoutMode(width){{return width>=1200?'desktop':width>760?'tablet':'mobile';}}
+    function preferenceKey(mode){{return 'npi_dashboard_v5:'+LAYOUT_OWNER+':'+mode;}}
+    function defaultLayout(width){{
+        const mode=layoutMode(width), pad=12, gap=12, inner=Math.max(1,width-pad*2);
+        const rects={{}};
+        function put(id,left,top,w,h){{rects[id]={{left,top,width:w,height:h}};}}
+        if(mode==='desktop'){{
+            const enquiry=320, bucket=240, hotspot=Math.max(320,inner*0.285);
+            put('delayCommitment',pad,pad,inner-enquiry-gap,220);
+            put('enquiry',width-pad-enquiry,pad,enquiry,220);
+            put('executive',pad,244,inner-bucket-hotspot-gap*2,350);
+            put('delayBucket',rects.executive.left+rects.executive.width+gap,244,bucket,350);
+            put('hotspot',width-pad-hotspot,244,hotspot,350);
+        }}else if(mode==='tablet'){{
+            const col=(inner-gap)/2;
+            put('delayCommitment',pad,pad,inner,180);
+            put('executive',pad,204,col,490);
+            put('hotspot',pad+col+gap,204,col,490);
+            put('delayBucket',pad,706,col,350);
+            put('enquiry',pad+col+gap,706,col,350);
+        }}else{{
+            const heights={{delayCommitment:280,executive:510,hotspot:320,delayBucket:350,enquiry:230}};
+            let top=pad;
+            ['delayCommitment','executive','hotspot','delayBucket','enquiry'].forEach(function(id){{
+                put(id,pad,top,inner,heights[id]);top+=heights[id]+gap;
+            }});
         }}
-
-    }};
-
-
-    /* ========================================================
-       GENERAL HELPERS
-       ======================================================== */
-
-    function getParentDocument() {{
-
-        try {{
-
-            return window.parent.document;
-
-        }}
-        catch (error) {{
-
-            return null;
-
-        }}
-
+        const height=Math.max(...Object.values(rects).map(r=>r.top+r.height))+pad;
+        return {{mode,width,rects,height}};
     }}
-
-
-    function clamp(
-        value,
-        minimum,
-        maximum
-    ) {{
-
-        return Math.max(
-            minimum,
-            Math.min(
-                maximum,
-                value
-            )
-        );
-
+    function overlaps(a,b){{return a.left<b.left+b.width && b.left<a.left+a.width && a.top<b.top+b.height && b.top<a.top+a.height;}}
+    function validRects(rects,width){{
+        if(!rects || !PANEL_IDS.every(id=>rects[id]))return false;
+        return PANEL_IDS.every(function(id,index){{
+            const r=rects[id];
+            return ['left','top','width','height'].every(k=>Number.isFinite(r[k])) &&
+                r.left>=0 && r.top>=0 && r.width>=Math.min(180,width-24) && r.height>=120 &&
+                r.left+r.width<=width+1 && r.top+r.height<=5000 &&
+                PANEL_IDS.slice(index+1).every(other=>!overlaps(r,rects[other]));
+        }});
     }}
-
-
-    /* ========================================================
-       LAYOUT SAVE
-       ======================================================== */
-
-    function saveLayout() {{
-
-        try {{
-
-            const layout = {{}};
-
-            document
-                .querySelectorAll(
-                    ".npi-floating-panel"
-                )
-                .forEach(
-                    function(panel) {{
-
-                        const id =
-                            panel.dataset.layoutId;
-
-                        layout[id] = {{
-
-                            left:
-                                panel.offsetLeft,
-
-                            top:
-                                panel.offsetTop,
-
-                            width:
-                                panel.offsetWidth,
-
-                            height:
-                                panel.offsetHeight
-
-                        }};
-
-                    }}
-                );
-
-
-            try {{
-
-                localStorage.setItem(
-                    STORAGE_KEY,
-                    JSON.stringify(layout)
-                );
-
-                return;
-
-            }}
-            catch (error) {{}}
-
-
-            try {{
-
-                window.parent.localStorage.setItem(
-                    STORAGE_KEY,
-                    JSON.stringify(layout)
-                );
-
-            }}
-            catch (error) {{}}
-
-        }}
-        catch (error) {{}}
-
+    function readPreferences(mode){{
+        try{{
+            const stored=JSON.parse(window.parent.localStorage.getItem(preferenceKey(mode))||'null');
+            if(stored && stored.version===LAYOUT_VERSION && stored.owner===LAYOUT_OWNER && stored.mode===mode && stored.custom===true)return stored;
+        }}catch(e){{}}
+        return null;
     }}
-
-
-    /* ========================================================
-       LAYOUT LOAD
-       ======================================================== */
-
-    function loadLayout() {{
-
-        try {{
-
-            let raw = null;
-
-
-            try {{
-
-                raw =
-                    localStorage.getItem(
-                        STORAGE_KEY
-                    );
-
-            }}
-            catch (error) {{}}
-
-
-            if (!raw) {{
-
-                try {{
-
-                    raw =
-                        window.parent.localStorage.getItem(
-                            STORAGE_KEY
-                        );
-
-                }}
-                catch (error) {{}}
-
-            }}
-
-
-            if (!raw) {{
-                return;
-            }}
-
-
-            const layout =
-                JSON.parse(raw);
-
-
-            Object.keys(layout)
-                .forEach(
-                    function(id) {{
-
-                        const panel =
-                            document.querySelector(
-                                '[data-layout-id="' +
-                                id +
-                                '"]'
-                            );
-
-
-                        if (!panel) {{
-                            return;
-                        }}
-
-
-                        const item =
-                            layout[id];
-
-
-                        if (
-                            Number.isFinite(
-                                item.left
-                            )
-                        ) {{
-
-                            panel.style.left =
-                                item.left + "px";
-
-                        }}
-
-
-                        if (
-                            Number.isFinite(
-                                item.top
-                            )
-                        ) {{
-
-                            panel.style.top =
-                                item.top + "px";
-
-                        }}
-
-
-                        if (
-                            Number.isFinite(
-                                item.width
-                            )
-                        ) {{
-
-                            panel.style.width =
-                                item.width + "px";
-
-                        }}
-
-
-                        if (
-                            Number.isFinite(
-                                item.height
-                            )
-                        ) {{
-
-                            panel.style.height =
-                                item.height + "px";
-
-                        }}
-
-                    }}
-                );
-
-        }}
-        catch (error) {{}}
-
+    function persistPreferences(){{
+        if(!currentPreferences || !currentPreferences.custom)return;
+        try{{window.parent.localStorage.setItem(preferenceKey(currentMode),JSON.stringify(currentPreferences));}}catch(e){{}}
     }}
-
-
-    /* ========================================================
-       RESET
-       ======================================================== */
-
-    function resetLayout() {{
-
-        try {{
-
-            localStorage.removeItem(
-                STORAGE_KEY
-            );
-
-        }}
-        catch (error) {{}}
-
-
-        try {{
-
-            window.parent.localStorage.removeItem(
-                STORAGE_KEY
-            );
-
-        }}
-        catch (error) {{}}
-
-
-        Object.keys(DEFAULT_LAYOUT)
-            .forEach(
-                function(id) {{
-
-                    const panel =
-                        document.querySelector(
-                            '[data-layout-id="' +
-                            id +
-                            '"]'
-                        );
-
-
-                    if (!panel) {{
-                        return;
-                    }}
-
-
-                    const item =
-                        DEFAULT_LAYOUT[id];
-
-
-                    panel.style.left =
-                        item.left + "px";
-
-                    panel.style.top =
-                        item.top + "px";
-
-                    panel.style.width =
-                        item.width + "px";
-
-                    panel.style.height =
-                        item.height + "px";
-
-                }}
-            );
-
-
-        saveLayout();
-        applyDashboardHeight(DEFAULT_DASHBOARD_HEIGHT, true);
-
+    function ensureCustom(){{
+        if(!currentPreferences)currentPreferences={{version:LAYOUT_VERSION,owner:LAYOUT_OWNER,mode:currentMode,custom:true}};
+        currentPreferences.custom=true;
     }}
-
-
-    /* ========================================================
-       DRAGGING
-       ======================================================== */
-
-    function enableDragging(panel) {{
-
-        const handle =
-            panel.querySelector(
-                "[data-drag-handle]"
-            );
-
-
-        if (!handle) {{
-            return;
-        }}
-
-
-        let dragging = false;
-
-        let startX = 0;
-        let startY = 0;
-
-        let startLeft = 0;
-        let startTop = 0;
-
-
-        handle.addEventListener(
-            "pointerdown",
-            function(event) {{
-
-                if (
-                    event.target.closest(
-                        "button"
-                    )
-                ) {{
-                    return;
-                }}
-
-
-                dragging = true;
-
-
-                startX =
-                    event.clientX;
-
-                startY =
-                    event.clientY;
-
-
-                startLeft =
-                    panel.offsetLeft;
-
-                startTop =
-                    panel.offsetTop;
-
-
-                try {{
-
-                    handle.setPointerCapture(
-                        event.pointerId
-                    );
-
-                }}
-                catch (error) {{}}
-
-
-                event.preventDefault();
-
-            }}
-        );
-
-
-        handle.addEventListener(
-            "pointermove",
-            function(event) {{
-
-                if (!dragging) {{
-                    return;
-                }}
-
-
-                const stage =
-                    document.getElementById(
-                        "npi-floating-stage"
-                    );
-
-
-                if (!stage) {{
-                    return;
-                }}
-
-
-                const dx =
-                    event.clientX
-                    - startX;
-
-
-                const dy =
-                    event.clientY
-                    - startY;
-
-
-                const maxLeft =
-                    Math.max(
-                        0,
-                        stage.clientWidth
-                        - panel.offsetWidth
-                    );
-
-
-                const maxTop =
-                    Math.max(
-                        0,
-                        stage.clientHeight
-                        - panel.offsetHeight
-                    );
-
-
-                panel.style.left =
-                    clamp(
-                        startLeft + dx,
-                        0,
-                        maxLeft
-                    ) + "px";
-
-
-                panel.style.top =
-                    clamp(
-                        startTop + dy,
-                        0,
-                        maxTop
-                    ) + "px";
-
-            }}
-        );
-
-
-        handle.addEventListener(
-            "pointerup",
-            function() {{
-
-                dragging = false;
-
-                saveLayout();
-
-            }}
-        );
-
-
-        handle.addEventListener(
-            "pointercancel",
-            function() {{
-
-                dragging = false;
-
-                saveLayout();
-
-            }}
-        );
-
+    function publishLayout(){{
+        window.dispatchEvent(new Event('npi-dashboard-layout'));
     }}
-
-
-    /* ========================================================
-       RESIZE SAVE
-       ======================================================== */
-
-    function enableResizeSaving(panel) {{
-
-        if (
-            typeof ResizeObserver
-            ===
-            "undefined"
-        ) {{
-            return;
+    function panelFor(id){{return document.querySelector('[data-layout-id="'+id+'"]');}}
+    function paintLayout(){{
+        if(!currentLayout)return;
+        const canvas=document.getElementById('npi-layout-canvas');
+        canvas.style.height=currentLayout.height+'px';
+        PANEL_IDS.forEach(function(id){{
+            const panel=panelFor(id), r=currentLayout.rects[id];if(!panel)return;
+            Object.keys(r).forEach(key=>panel.style.setProperty(key,r[key]+'px'));
+            panel.style.resize=currentMode==='desktop' && id!=='enquiry'?'both':'none';
+        }});
+        const executive=panelFor('executive');
+        const donut=executive && executive.querySelector('.npi-floating-donut');
+        if(donut){{
+            const size=currentMode==='desktop'?Math.min(260,Math.max(180,currentLayout.rects.executive.width*0.38)):210;
+            donut.style.width=size+'px';donut.style.height=size+'px';donut.style.flexBasis=size+'px';
         }}
-
-
-        let lastWidth =
-            panel.offsetWidth;
-
-
-        let lastHeight =
-            panel.offsetHeight;
-
-
-        const observer =
-            new ResizeObserver(
-                function() {{
-
-                    if (
-                        panel.offsetWidth
-                        !==
-                        lastWidth
-                        ||
-                        panel.offsetHeight
-                        !==
-                        lastHeight
-                    ) {{
-
-                        lastWidth =
-                            panel.offsetWidth;
-
-                        lastHeight =
-                            panel.offsetHeight;
-
-
-                        saveLayout();
-
-                    }}
-
-                }}
-            );
-
-
-        observer.observe(panel);
-
+        document.getElementById('npi-floating-stage').dataset.layoutMode=currentMode;
+        publishLayout();
     }}
-
+    function reflowLayout(){{
+        const scroll=document.getElementById('npi-dashboard-scroll');
+        const width=Math.max(1,scroll.clientWidth);
+        const base=defaultLayout(width), changed=base.mode!==currentMode;
+        if(changed){{currentMode=base.mode;currentPreferences=readPreferences(currentMode);}}
+        currentLayout=base;
+        const saved=currentPreferences && currentPreferences.widgets;
+        // Absolute custom geometry is restored only at the width where the user chose it.
+        // At another width use readable defaults; retain the saved preference for return.
+        if(saved && Math.abs(Number(currentPreferences.width)-width)<=2 && validRects(saved,width)){{
+            currentLayout.rects=JSON.parse(JSON.stringify(saved));
+            currentLayout.height=Math.max(...Object.values(saved).map(r=>r.top+r.height))+12;
+        }}
+        DEFAULT_DASHBOARD_HEIGHT=base.height+18;
+        paintLayout();
+        applyDashboardHeight(readDashboardHeight(),false);
+    }}
+    function loadLayout(){{reflowLayout();}}
+    function saveLayout(){{
+        // Called only on completion of an explicit user gesture.
+        ensureCustom();
+        currentPreferences.width=currentLayout.width;
+        currentPreferences.widgets=JSON.parse(JSON.stringify(currentLayout.rects));
+        persistPreferences();
+    }}
+    function saveDashboardHeight(height){{
+        ensureCustom();currentPreferences.dashboardHeight=height;persistPreferences();
+    }}
+    function updatePanel(id,patch,save){{
+        if(currentMode!=='desktop' || !currentLayout.rects[id])return false;
+        const rects=JSON.parse(JSON.stringify(currentLayout.rects));
+        Object.assign(rects[id],patch);
+        if(!validRects(rects,currentLayout.width)){{paintLayout();return false;}}
+        currentLayout.rects=rects;
+        currentLayout.height=Math.max(...Object.values(rects).map(r=>r.top+r.height))+12;
+        paintLayout();if(save)saveLayout();return true;
+    }}
+    function resetLayout(){{
+        // Reset every viewport preference for this user only. Legacy data is untouched.
+        ['desktop','tablet','mobile'].forEach(function(mode){{
+            try{{window.parent.localStorage.removeItem(preferenceKey(mode));}}catch(e){{}}
+        }});
+        currentPreferences=null;currentMode=null;reflowLayout();
+    }}
+    function enableDragging(panel){{
+        const handle=panel.querySelector('[data-drag-handle]');if(!handle)return;
+        let drag=null;
+        handle.addEventListener('pointerdown',function(event){{
+            if(currentMode!=='desktop' || event.button!==0 || event.target.closest('button'))return;
+            const r=currentLayout.rects[panel.dataset.layoutId];
+            drag={{x:event.clientX,y:event.clientY,left:r.left,top:r.top}};gestureDepth++;
+            try{{handle.setPointerCapture(event.pointerId);}}catch(e){{}}event.preventDefault();
+        }});
+        handle.addEventListener('pointermove',function(event){{
+            if(!drag)return;
+            updatePanel(panel.dataset.layoutId,{{left:Math.max(0,drag.left+event.clientX-drag.x),top:Math.max(0,drag.top+event.clientY-drag.y)}},false);
+        }});
+        function finish(){{if(!drag)return;drag=null;gestureDepth=Math.max(0,gestureDepth-1);saveLayout();}}
+        handle.addEventListener('pointerup',finish);handle.addEventListener('pointercancel',finish);
+    }}
+    function enableResizeSaving(panel){{
+        let resizing=false;
+        panel.addEventListener('pointerdown',function(event){{
+            if(currentMode!=='desktop')return;
+            const r=panel.getBoundingClientRect();
+            if(event.clientX>=r.right-18 && event.clientY>=r.bottom-18){{resizing=true;gestureDepth++;}}
+        }});
+        function finish(){{
+            if(!resizing)return;resizing=false;gestureDepth=Math.max(0,gestureDepth-1);
+            updatePanel(panel.dataset.layoutId,{{width:panel.offsetWidth,height:panel.offsetHeight}},true);
+        }}
+        document.addEventListener('pointerup',finish);document.addEventListener('pointercancel',finish);
+    }}
+    window.__npiDashboardLayoutV5={{owner:LAYOUT_OWNER,getLayout:()=>currentLayout,updatePanel,resetLayout,
+        beginGesture:()=>gestureDepth++,endGesture:()=>{{gestureDepth=Math.max(0,gestureDepth-1);}},sync:publishLayout}};
+    window.addEventListener('resize',function(){{
+        clearTimeout(resizeTimer);resizeTimer=setTimeout(function(){{if(!gestureDepth)reflowLayout();}},80);
+    }});
 
     /* ========================================================
        FIND STREAMLIT BRIDGE BUTTON
@@ -4820,26 +4472,12 @@ body {{
        RESIZABLE DASHBOARD / DRILLDOWN BOUNDARY
        ======================================================== */
 
-    const DASHBOARD_HEIGHT_KEY = "npi_control_tower_dashboard_stage_height_v2";
-    const DEFAULT_DASHBOARD_HEIGHT = 553;
+    let DEFAULT_DASHBOARD_HEIGHT = 624;
     const MAX_DASHBOARD_HEIGHT = 900;
-
-    function getDashboardMinimumHeight() {{
-        // Keep the initial dashboard height at 553px, but let the user
-        // drag the bottom boundary upward to 300px when they want a tighter
-        // transition into Drilldown. The boundary is a user-controlled layout
-        // height, so it must not be clamped to the lowest floating panel.
-        return 300;
-    }}
-
+    function getDashboardMinimumHeight() {{ return 300; }}
     function readDashboardHeight() {{
-        let raw = null;
-        try {{ raw = localStorage.getItem(DASHBOARD_HEIGHT_KEY); }} catch (error) {{}}
-        if (!raw) {{
-            try {{ raw = window.parent.localStorage.getItem(DASHBOARD_HEIGHT_KEY); }} catch (error) {{}}
-        }}
-        const value = Number(raw);
-        return Number.isFinite(value) && value > 0 ? value : DEFAULT_DASHBOARD_HEIGHT;
+        const height=currentPreferences && currentPreferences.dashboardHeight;
+        return Number.isFinite(height) ? height : DEFAULT_DASHBOARD_HEIGHT;
     }}
 
     function syncDrilldownGap() {{
@@ -4903,7 +4541,7 @@ body {{
         const minimum = getDashboardMinimumHeight();
         const numeric = Number(requestedHeight);
         const wanted = Number.isFinite(numeric) ? numeric : DEFAULT_DASHBOARD_HEIGHT;
-        const height = clamp(Math.max(wanted, minimum), minimum, MAX_DASHBOARD_HEIGHT);
+        const height = clamp(wanted, minimum, Math.max(MAX_DASHBOARD_HEIGHT, DEFAULT_DASHBOARD_HEIGHT));
         stage.style.setProperty("height", height + "px", "important");
         stage.style.setProperty("min-height", height + "px", "important");
 
@@ -4954,9 +4592,9 @@ body {{
         try {{ window.parent.setTimeout(syncDrilldownGap, 40); }} catch (error) {{}}
 
         if (persist) {{
-            try {{ localStorage.setItem(DASHBOARD_HEIGHT_KEY, String(height)); }} catch (error) {{}}
-            try {{ window.parent.localStorage.setItem(DASHBOARD_HEIGHT_KEY, String(height)); }} catch (error) {{}}
+            saveDashboardHeight(height);
         }}
+        publishLayout();
         return height;
     }}
 
@@ -5062,6 +4700,14 @@ body {{
 
         loadLayout();
         setupDashboardBoundary();
+        if (typeof ResizeObserver !== "undefined") {{
+            let lastWidth=document.getElementById('npi-dashboard-scroll').clientWidth;
+            const widthObserver=new ResizeObserver(function() {{
+                const width=document.getElementById('npi-dashboard-scroll').clientWidth;
+                if(Math.abs(width-lastWidth)>1 && !gestureDepth) {{lastWidth=width;reflowLayout();}}
+            }});
+            widthObserver.observe(document.getElementById('npi-dashboard-scroll'));
+        }}
 
         wireLegend();
 
@@ -5122,7 +4768,7 @@ body {{
 
     components.html(
         floating_html,
-        height=553,
+        height=624,
         scrolling=False,
     )
 
@@ -5153,344 +4799,132 @@ body {{
         if search_message:
             st.caption(search_message)
 
-    # Float the real Streamlit form as an absolutely-positioned child of the
-    # shared content area. Absolute positioning lets it scroll with the page,
-    # while its coordinates remain relative to the floating dashboard stage.
-    # Rebind handlers on reruns so an earlier controller cannot pin the panel.
+    # Position the existing native form over its shared dashboard slot; no DOM moves.
     components.html(
-        """
-        <script>
-        (function () {
-            try {
-                const parentWin = window.parent;
-                const parentDoc = parentWin.document;
-                const CONTROLLER_KEY = "__npiEnquiryFinderFloatControllerV3";
-                const LEGACY_KEY = "__npiEnquiryFinderFloatController";
-                const STORAGE_KEY = "npiEnquiryFinderLayoutV1";
+        f"""<script>
+(function(){{
+    const parentWin=window.parent, parentDoc=parentWin.document, owner={json.dumps(dashboard_layout_owner)};
+    const KEY='__npiEnquiryLayoutV5';
+    const previous=parentWin[KEY];if(previous && previous.dispose)previous.dispose();
+    // Retire old live controllers as well as ignoring their localStorage records.
+    ['__npiEnquiryFinderFloatControllerV3','__npiEnquiryFinderFloatController'].forEach(function(key){{
+        const old=parentWin[key];if(!old)return;
+        try{{if(old.observer)old.observer.disconnect();if(old.resizeObserver)old.resizeObserver.disconnect();}}catch(e){{}}
+        ['observerTimer','saveTimer'].forEach(name=>{{try{{if(old[name])parentWin.clearTimeout(old[name]);}}catch(e){{}}}});
+        if(old.handlers)Object.entries(old.handlers).forEach(function(entry){{
+            try{{(entry[0]==='resize'?parentWin:old.listenerDocument).removeEventListener(entry[0],entry[1],entry[0]==='resize'?false:true);}}catch(e){{}}
+        }});
+        old.retired=true;old.container=null;parentWin[key]=null;
+    }});
+    let panel=null,frame=null,api=null,drag=null,resizing=null,observer=null,raf=null,disposed=false;
+    const removals=[];
+    function listen(target,type,fn,options){{target.addEventListener(type,fn,options);removals.push(()=>target.removeEventListener(type,fn,options));}}
+    function schedule(){{if(disposed || raf)return;raf=parentWin.requestAnimationFrame(function(){{
+        raf=null;
+        try{{sync();}}catch(e){{
+            // Preserve the real native form if frontend geometry changes unexpectedly.
+            if(panel){{
+                panel.style.cssText='';
+                let node=panel;
+                while(node && node!==parentDoc.body){{
+                    if(node.getAttribute && node.getAttribute('data-testid')==='stElementContainer'){{node.style.cssText='';break;}}
+                    node=node.parentElement;
+                }}
+            }}
+        }}
+    }});}}
+    function sync(){{
+        if(disposed || drag || resizing)return;
+        panel=parentDoc.querySelector('div[class*="st-key-npi_enquiry_search_section"]');
+        if(!panel)return;
+        frame=Array.from(parentDoc.querySelectorAll('iframe')).find(function(item){{
+            try{{return item.contentWindow.__npiDashboardLayoutV5 && item.contentWindow.__npiDashboardLayoutV5.owner===owner;}}catch(e){{return false;}}
+        }});
+        if(!frame){{panel.style.setProperty('visibility','hidden');return;}}
+        const next=frame.contentWindow.__npiDashboardLayoutV5;
+        if(api!==next){{
+            api=next;
+            listen(frame.contentWindow,'npi-dashboard-layout',schedule);
+            listen(frame.contentDocument.getElementById('npi-dashboard-scroll'),'scroll',schedule,{{passive:true}});
+        }}
+        const slot=frame.contentDocument.querySelector('[data-layout-id="enquiry"]');
+        if(!slot)return;
+        let block=panel;
+        while(block && block!==parentDoc.body){{
+            if(block.getAttribute && block.getAttribute('data-testid')==='stElementContainer'){{
+                Object.assign(block.style,{{display:'contents',height:'0px',minHeight:'0px',margin:'0px',padding:'0px',overflow:'visible'}});break;
+            }}block=block.parentElement;
+        }}
+        panel.style.position='absolute';
+        const offset=panel.offsetParent || parentDoc.body;
+        const base=offset.getBoundingClientRect(),fr=frame.getBoundingClientRect(),r=slot.getBoundingClientRect();
+        const view=frame.contentDocument.getElementById('npi-dashboard-scroll').getBoundingClientRect();
+        const top=fr.top+r.top,left=fr.left+r.left;
+        const clipTop=Math.max(0,view.top-r.top),clipBottom=Math.max(0,r.bottom-view.bottom);
+        const clipLeft=Math.max(0,view.left-r.left),clipRight=Math.max(0,r.right-view.right);
+        const visible=clipTop+clipBottom<r.height && clipLeft+clipRight<r.width;
+        const desktop=api.getLayout().mode==='desktop';
+        Object.assign(panel.style,{{
+            left:(left-base.left+offset.scrollLeft-offset.clientLeft)+'px',
+            top:(top-base.top+offset.scrollTop-offset.clientTop)+'px',width:r.width+'px',height:r.height+'px',
+            minWidth:'0px',minHeight:'0px',maxWidth:'none',maxHeight:'none',boxSizing:'border-box',
+            padding:'10px',background:'#fff',border:'1px solid #d8e2ed',borderRadius:'12px',
+            boxShadow:'0 3px 10px rgba(25,48,76,.07)',overflow:'auto',resize:desktop?'both':'none',
+            zIndex:'100',visibility:visible?'visible':'hidden',
+            clipPath:'inset('+clipTop+'px '+clipRight+'px '+clipBottom+'px '+clipLeft+'px)'
+        }});
+        const heading=panel.querySelector('h3');
+        if(heading)Object.assign(heading.style,{{fontFamily:'Arial,Helvetica,sans-serif',fontSize:'12px',lineHeight:'18px',fontWeight:'800',
+            margin:'-10px -10px 8px',padding:'10px 12px',background:'#20354f',color:'#fff',borderBottom:'1px solid #d8e2ed',
+            cursor:desktop?'grab':'default',touchAction:desktop?'none':'auto',userSelect:'none'}});
+        panel.querySelectorAll('[data-testid="stVerticalBlock"]').forEach(block=>block.style.gap='.3rem');
+    }}
+    listen(parentDoc,'pointerdown',function(event){{
+        if(!panel || !api || api.getLayout().mode!=='desktop' || event.button!==0 || !panel.contains(event.target))return;
+        const r=panel.getBoundingClientRect();
+        if(event.clientX>=r.right-18 && event.clientY>=r.bottom-18){{resizing=true;api.beginGesture();return;}}
+        if(!event.target.closest('h3'))return;
+        const original=api.getLayout().rects.enquiry;
+        drag={{x:event.clientX,y:event.clientY,left:original.left,top:original.top}};api.beginGesture();
+        try{{event.target.closest('h3').setPointerCapture(event.pointerId);}}catch(e){{}}event.preventDefault();
+    }},true);
+    listen(parentDoc,'pointermove',function(event){{
+        if(!drag)return;
+        api.updatePanel('enquiry',{{left:Math.max(0,drag.left+event.clientX-drag.x),top:Math.max(0,drag.top+event.clientY-drag.y)}},false);
+        // Temporarily release the sync guard to follow the shared slot.
+        const keep=drag;drag=null;sync();drag=keep;
+    }},true);
+    function finish(){{
+        if(!api || (!drag && !resizing))return;
+        const patch=resizing?{{width:panel.offsetWidth,height:panel.offsetHeight}}:{{}};
+        drag=null;resizing=null;api.endGesture();api.updatePanel('enquiry',patch,true);schedule();
+    }}
+    listen(parentDoc,'pointerup',finish,true);listen(parentDoc,'pointercancel',finish,true);
+    listen(parentWin,'resize',schedule);listen(parentWin,'scroll',schedule,{{capture:true,passive:true}});
+    listen(parentDoc,'wheel',function(event){{
+        if(!panel || !frame || !panel.contains(event.target))return;
+        const target=event.target.closest('textarea');
+        function canScroll(element){{return element && ((event.deltaY>0 && element.scrollTop+element.clientHeight<element.scrollHeight-1) || (event.deltaY<0 && element.scrollTop>0));}}
+        if(canScroll(target) || canScroll(panel))return;
+        const scroll=frame.contentDocument.getElementById('npi-dashboard-scroll');
+        if(scroll.scrollHeight>scroll.clientHeight){{scroll.scrollTop+=event.deltaY;event.preventDefault();schedule();}}
+    }},{{passive:false}});
+    observer=new parentWin.MutationObserver(schedule);observer.observe(parentDoc.body,{{childList:true,subtree:true}});
+    const timers=[0,100,300,700,1200].map(delay=>parentWin.setTimeout(schedule,delay));
+    parentWin[KEY]={{owner,dispose:function(){{disposed=true;removals.forEach(fn=>fn());observer.disconnect();timers.forEach(t=>parentWin.clearTimeout(t));if(raf)parentWin.cancelAnimationFrame(raf);}}}};
+    // The installer itself must not reserve space in the page flow.
+    try{{
+        const installer=window.frameElement;installer.style.cssText='position:absolute;width:1px;height:1px;opacity:0;pointer-events:none';
+        let block=installer;while(block && block!==parentDoc.body){{
+            if(block.getAttribute && block.getAttribute('data-testid')==='stElementContainer'){{
+                block.style.cssText='position:absolute;width:1px;height:1px;min-height:0;margin:0;padding:0;overflow:hidden';break;
+            }}block=block.parentElement;
+        }}
+    }}catch(e){{}}
+    schedule();
+}})();
 
-                // This tiny components.html iframe only installs drag/resize listeners.
-                // Keep its script active but take its wrapper out of page flow so it
-                // does not add another vertical gap before the Drilldown.
-                try {
-                    const controllerFrame = window.frameElement;
-                    if (controllerFrame) {
-                        controllerFrame.style.setProperty("position", "absolute", "important");
-                        controllerFrame.style.setProperty("left", "0px", "important");
-                        controllerFrame.style.setProperty("top", "0px", "important");
-                        controllerFrame.style.setProperty("width", "1px", "important");
-                        controllerFrame.style.setProperty("height", "1px", "important");
-                        controllerFrame.style.setProperty("min-height", "1px", "important");
-                        controllerFrame.style.setProperty("opacity", "0", "important");
-                        controllerFrame.style.setProperty("pointer-events", "none", "important");
-                        let controllerBlock = controllerFrame;
-                        while (controllerBlock && controllerBlock !== parentDoc.body) {
-                            if (controllerBlock.getAttribute && controllerBlock.getAttribute("data-testid") === "stElementContainer") break;
-                            controllerBlock = controllerBlock.parentElement;
-                        }
-                        if (controllerBlock && controllerBlock !== parentDoc.body) {
-                            controllerBlock.style.setProperty("position", "absolute", "important");
-                            controllerBlock.style.setProperty("left", "0px", "important");
-                            controllerBlock.style.setProperty("top", "0px", "important");
-                            controllerBlock.style.setProperty("width", "1px", "important");
-                            controllerBlock.style.setProperty("height", "1px", "important");
-                            controllerBlock.style.setProperty("min-height", "1px", "important");
-                            controllerBlock.style.setProperty("max-height", "1px", "important");
-                            controllerBlock.style.setProperty("margin", "0px", "important");
-                            controllerBlock.style.setProperty("padding", "0px", "important");
-                            controllerBlock.style.setProperty("overflow", "hidden", "important");
-                        }
-                    }
-                } catch (e) {}
-
-                // Retire the prior fixed-position controller, whose old scroll
-                // listeners can otherwise keep re-applying viewport coordinates.
-                const legacy = parentWin[LEGACY_KEY];
-                if (legacy) {
-                    try { if (legacy.observer) legacy.observer.disconnect(); } catch (e) {}
-                    try { if (legacy.resizeObserver) legacy.resizeObserver.disconnect(); } catch (e) {}
-                    try { if (legacy.observerTimer) parentWin.clearTimeout(legacy.observerTimer); } catch (e) {}
-                    legacy.container = null;
-                    legacy.drag = null;
-                    legacy.retired = true;
-                }
-
-                function removeStoredListeners(target, handlers) {
-                    if (!target || !handlers) return;
-                    try { if (handlers.pointerdown) target.removeEventListener("pointerdown", handlers.pointerdown, true); } catch (e) {}
-                    try { if (handlers.pointermove) target.removeEventListener("pointermove", handlers.pointermove, true); } catch (e) {}
-                    try { if (handlers.pointerup) target.removeEventListener("pointerup", handlers.pointerup, true); } catch (e) {}
-                    try { if (handlers.pointercancel) target.removeEventListener("pointercancel", handlers.pointercancel, true); } catch (e) {}
-                    try { if (handlers.resize) parentWin.removeEventListener("resize", handlers.resize); } catch (e) {}
-                }
-
-                let state = parentWin[CONTROLLER_KEY];
-                if (!state) {
-                    let savedLayout = null;
-                    try { savedLayout = JSON.parse(parentWin.localStorage.getItem(STORAGE_KEY) || "null"); } catch (e) {}
-                    const defaults = { left: 12, top: 5, width: 282, height: 190 };
-                    const layout = Object.assign({}, defaults, savedLayout || {});
-                    ["left", "top", "width", "height"].forEach(function (key) {
-                        const value = Number(layout[key]);
-                        layout[key] = Number.isFinite(value) ? value : defaults[key];
-                    });
-                    state = {
-                        layout: layout,
-                        container: null,
-                        drag: null,
-                        observer: null,
-                        observerTimer: null,
-                        resizeObserver: null,
-                        saveTimer: null,
-                        listenerDocument: null,
-                        handlers: null
-                    };
-                    parentWin[CONTROLLER_KEY] = state;
-                }
-
-                // components.html may execute again while the parent document
-                // remains alive. Remove this controller's old handlers and
-                // observers before binding handlers to the current app DOM.
-                removeStoredListeners(state.listenerDocument, state.handlers);
-                try { if (state.observer) state.observer.disconnect(); } catch (e) {}
-                try { if (state.resizeObserver) state.resizeObserver.disconnect(); } catch (e) {}
-                try { if (state.observerTimer) parentWin.clearTimeout(state.observerTimer); } catch (e) {}
-                state.observer = null;
-                state.resizeObserver = null;
-                state.drag = null;
-                state.listenerDocument = parentDoc;
-                state.handlers = null;
-
-                function getDashboardFrame() {
-                    const frames = parentDoc.querySelectorAll("iframe");
-                    for (const frame of frames) {
-                        try {
-                            if (frame.contentDocument && frame.contentDocument.getElementById("npi-floating-stage")) return frame;
-                        } catch (e) {}
-                    }
-                    return null;
-                }
-
-                function getPanel() {
-                    return parentDoc.querySelector('div[class*="st-key-npi_enquiry_search_section"]');
-                }
-
-                function collapseOriginalFinderFlow(panel) {
-                    if (!panel) return;
-                    let node = panel;
-                    for (let depth = 0; node && node !== parentDoc.body && depth < 12; depth++, node = node.parentElement) {
-                        if (node.getAttribute && node.getAttribute("data-testid") === "stElementContainer") {
-                            // Keep the native form DOM alive for Streamlit callbacks but remove its
-                            // old placeholder height from normal page flow. The panel itself is
-                            // absolutely positioned over the floating dashboard by positionPanel().
-                            node.style.setProperty("display", "contents", "important");
-                            node.style.setProperty("height", "0px", "important");
-                            node.style.setProperty("min-height", "0px", "important");
-                            node.style.setProperty("margin", "0px", "important");
-                            node.style.setProperty("padding", "0px", "important");
-                            node.style.setProperty("overflow", "visible", "important");
-                            return;
-                        }
-                    }
-                }
-
-                function findSharedRoot(frame, panel) {
-                    let candidate = panel;
-                    while (candidate && candidate !== parentDoc.body) {
-                        if (candidate.contains(frame)) return candidate;
-                        candidate = candidate.parentElement;
-                    }
-                    return parentDoc.querySelector('[data-testid="stMainBlockContainer"]') || parentDoc.body;
-                }
-
-                function getMetrics(panel) {
-                    const frame = getDashboardFrame();
-                    if (!frame || !panel) return null;
-                    let stage = null;
-                    try { stage = frame.contentDocument.getElementById("npi-floating-stage"); } catch (e) {}
-                    if (!stage) return null;
-                    const frameRect = frame.getBoundingClientRect();
-                    const stageRect = stage.getBoundingClientRect();
-                    const sharedRoot = findSharedRoot(frame, panel);
-                    if (sharedRoot && sharedRoot !== parentDoc.body) {
-                        try {
-                            if (parentWin.getComputedStyle(sharedRoot).position === "static") {
-                                sharedRoot.style.setProperty("position", "relative", "important");
-                            }
-                        } catch (e) {}
-                    }
-                    return {
-                        frame: frame,
-                        frameRect: frameRect,
-                        stageRect: stageRect,
-                        root: sharedRoot,
-                        width: Math.max(1, stage.clientWidth || frame.clientWidth || stageRect.width),
-                        height: Math.max(1, stage.clientHeight || 455)
-                    };
-                }
-
-                function clamp(value, minimum, maximum) {
-                    return Math.max(minimum, Math.min(maximum, value));
-                }
-
-                function saveLayout() {
-                    try {
-                        if (state.saveTimer) parentWin.clearTimeout(state.saveTimer);
-                        state.saveTimer = parentWin.setTimeout(function () {
-                            try { parentWin.localStorage.setItem(STORAGE_KEY, JSON.stringify(state.layout)); } catch (e) {}
-                        }, 120);
-                    } catch (e) {}
-                }
-
-                function positionPanel(panel) {
-                    const metrics = getMetrics(panel);
-                    if (!metrics || !panel) return false;
-                    const width = Math.min(state.layout.width, metrics.width);
-                    const height = Math.min(state.layout.height, metrics.height);
-                    state.layout.width = Math.max(250, width);
-                    state.layout.height = Math.max(160, height);
-                    state.layout.left = clamp(state.layout.left, 0, Math.max(0, metrics.width - state.layout.width));
-                    state.layout.top = clamp(state.layout.top, 0, Math.max(0, metrics.height - state.layout.height));
-
-                    // Use the actual offset parent as the positioning coordinate
-                    // system. The panel is absolute, not fixed, so normal page
-                    // scrolling moves it together with the dashboard content.
-                    panel.style.setProperty("position", "absolute", "important");
-                    const offsetParent = panel.offsetParent || metrics.root || parentDoc.body;
-                    const parentRect = offsetParent.getBoundingClientRect();
-                    const left = metrics.frameRect.left + metrics.stageRect.left - parentRect.left
-                        + (offsetParent.scrollLeft || 0) - (offsetParent.clientLeft || 0) + state.layout.left;
-                    const top = metrics.frameRect.top + metrics.stageRect.top - parentRect.top
-                        + (offsetParent.scrollTop || 0) - (offsetParent.clientTop || 0) + state.layout.top;
-
-                    panel.style.setProperty("left", left + "px", "important");
-                    panel.style.setProperty("top", top + "px", "important");
-                    panel.style.setProperty("width", state.layout.width + "px", "important");
-                    panel.style.setProperty("height", state.layout.height + "px", "important");
-                    panel.style.setProperty("min-width", "250px", "important");
-                    panel.style.setProperty("min-height", "160px", "important");
-                    panel.style.setProperty("max-width", Math.max(250, metrics.width - state.layout.left) + "px", "important");
-                    panel.style.setProperty("max-height", Math.max(160, metrics.height - state.layout.top) + "px", "important");
-                    panel.style.setProperty("overflow", "auto", "important");
-                    panel.style.setProperty("resize", "both", "important");
-                    panel.style.setProperty("z-index", "2147483000", "important");
-                    panel.style.setProperty("box-sizing", "border-box", "important");
-                    panel.style.setProperty("background", "#FFFFFF", "important");
-                    panel.style.setProperty("border", "1px solid #C9CDD3", "important");
-                    panel.style.setProperty("border-radius", "8px", "important");
-                    panel.style.setProperty("box-shadow", "0 2px 8px rgba(0,0,0,0.18)", "important");
-                    panel.style.setProperty("padding", "8px", "important");
-
-                    panel.querySelectorAll('[data-testid="stVerticalBlock"]').forEach(function (block) {
-                        block.style.setProperty("gap", "0.3rem", "important");
-                    });
-                    const heading = panel.querySelector("h3");
-                    if (heading) {
-                        heading.style.setProperty("cursor", state.drag ? "grabbing" : "grab", "important");
-                        heading.style.setProperty("user-select", "none", "important");
-                        heading.style.setProperty("touch-action", "none", "important");
-                        heading.style.setProperty("font-size", "13px", "important");
-                        heading.style.setProperty("line-height", "18px", "important");
-                        heading.style.setProperty("margin", "-8px -8px 4px -8px", "important");
-                        heading.style.setProperty("padding", "7px 9px", "important");
-                        heading.style.setProperty("background", "#EEF0F2", "important");
-                        heading.style.setProperty("border-bottom", "1px solid #D6D9DD", "important");
-                    }
-                    return true;
-                }
-
-                function ensurePanel() {
-                    const panel = getPanel();
-                    if (!panel) return;
-                    collapseOriginalFinderFlow(panel);
-                    if (state.container !== panel) {
-                        try { if (state.resizeObserver) state.resizeObserver.disconnect(); } catch (e) {}
-                        state.resizeObserver = null;
-                        state.container = panel;
-                    }
-                    if (!state.drag) positionPanel(panel);
-                    if (!state.resizeObserver && parentWin.ResizeObserver) {
-                        state.resizeObserver = new parentWin.ResizeObserver(function () {
-                            if (!state.container || state.drag) return;
-                            const rect = state.container.getBoundingClientRect();
-                            const width = Math.round(rect.width);
-                            const height = Math.round(rect.height);
-                            if (width >= 250 && Math.abs(width - state.layout.width) > 2) state.layout.width = width;
-                            if (height >= 160 && Math.abs(height - state.layout.height) > 2) state.layout.height = height;
-                            saveLayout();
-                            positionPanel(state.container);
-                        });
-                        state.resizeObserver.observe(panel);
-                    }
-                }
-
-                const handlers = {
-                    pointerdown: function (event) {
-                        if (event.button !== undefined && event.button !== 0) return;
-                        const target = event.target && event.target.nodeType === 1 ? event.target : null;
-                        const panel = state.container || getPanel();
-                        if (!target || !panel || !panel.contains(target)) return;
-                        const heading = target.closest("h3");
-                        if (!heading || !panel.contains(heading)) return;
-                        const metrics = getMetrics(panel);
-                        if (!metrics) return;
-                        state.drag = {
-                            startX: event.clientX,
-                            startY: event.clientY,
-                            startLeft: state.layout.left,
-                            startTop: state.layout.top,
-                            pointerId: event.pointerId
-                        };
-                        heading.style.setProperty("cursor", "grabbing", "important");
-                        try { event.preventDefault(); } catch (e) {}
-                    },
-                    pointermove: function (event) {
-                        if (!state.drag) return;
-                        const panel = state.container || getPanel();
-                        const metrics = getMetrics(panel);
-                        if (!metrics) return;
-                        state.layout.left = clamp(state.drag.startLeft + event.clientX - state.drag.startX, 0, Math.max(0, metrics.width - state.layout.width));
-                        state.layout.top = clamp(state.drag.startTop + event.clientY - state.drag.startY, 0, Math.max(0, metrics.height - state.layout.height));
-                        if (panel) positionPanel(panel);
-                    },
-                    pointerup: function () {
-                        if (!state.drag) return;
-                        state.drag = null;
-                        saveLayout();
-                        if (state.container) positionPanel(state.container);
-                    },
-                    pointercancel: function () {
-                        if (!state.drag) return;
-                        state.drag = null;
-                        saveLayout();
-                        if (state.container) positionPanel(state.container);
-                    },
-                    resize: function () {
-                        if (state.container && !state.drag) positionPanel(state.container);
-                    }
-                };
-                state.handlers = handlers;
-                state.listenerDocument = parentDoc;
-                parentDoc.addEventListener("pointerdown", handlers.pointerdown, true);
-                parentDoc.addEventListener("pointermove", handlers.pointermove, true);
-                parentDoc.addEventListener("pointerup", handlers.pointerup, true);
-                parentDoc.addEventListener("pointercancel", handlers.pointercancel, true);
-                parentWin.addEventListener("resize", handlers.resize);
-
-                ensurePanel();
-                state.observer = new parentWin.MutationObserver(function () {
-                    if (state.observerTimer) parentWin.clearTimeout(state.observerTimer);
-                    state.observerTimer = parentWin.setTimeout(ensurePanel, 80);
-                });
-                state.observer.observe(parentDoc.body, { childList: true, subtree: true });
-                [100, 300, 700, 1200].forEach(function (delay) {
-                    parentWin.setTimeout(ensurePanel, delay);
-                });
-            } catch (error) {
-                // The normal native Streamlit form remains available if floating setup fails.
-            }
-        })();
-        </script>
-        """,
+        </script>""",
         height=1,
         scrolling=False,
     )
@@ -6175,8 +5609,18 @@ def render_drilldown(df, title):
     # SHARED SUPABASE COMMITMENTS
     # ========================================================
 
+    saved_message = st.session_state.pop("_npi_commitment_success_message", None)
+    if saved_message:
+        st.success(saved_message)
+
     commitment_lookup = {}
     current_user_id = safe_text(st.session_state.get("npi_user_id")).strip()
+    if st.session_state.get("_npi_popup_owner") != current_user_id:
+        st.session_state["_npi_popup_owner"] = current_user_id
+        st.session_state["_npi_popup_bridge_id"] = py_secrets.token_urlsafe(24)
+        st.session_state["_npi_popup_requests"] = {}
+    popup_bridge_id = st.session_state["_npi_popup_bridge_id"]
+    popup_requests = st.session_state["_npi_popup_requests"]
     if current_user_id:
         part_keys_for_commitments = []
         if part_col and part_col in display_df.columns:
@@ -6691,6 +6135,11 @@ def render_drilldown(df, title):
                 border: 1px solid #d8e0ea;
                 border-radius: 10px;
                 overflow: auto;
+                overflow-x: auto !important;
+                overflow-y: auto !important;
+                -webkit-overflow-scrolling: touch;
+                touch-action: pan-x pan-y;
+                overscroll-behavior-x: contain;
                 background: #ffffff;
                 box-shadow: 0 2px 8px rgba(15, 35, 60, 0.07);
                 scrollbar-color: #aebdce #f3f6fa;
@@ -6719,26 +6168,11 @@ def render_drilldown(df, title):
         """
     )
 
-    # QR Scanner V1: open the existing Part Detail popup from a QR scan.
-    # The blank popup is opened directly from the Scan button click so mobile
-    # browsers are less likely to block it after the asynchronous camera scan.
-    html_parts.append(
-        """
-        <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
-        <div id="npi-qr-toolbar" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 12px;margin:0 0 8px;background:#f0f8fb;border:1px solid #cce5ed;border-radius:10px;">
-          <button type="button" id="npi-qr-start" style="border:0;border-radius:8px;background:#087f8c;color:#fff;padding:10px 16px;font:750 13px Inter,Segoe UI,Arial,sans-serif;cursor:pointer;touch-action:manipulation;">📷 Scan Job Traveller QR</button>
-          <button type="button" id="npi-qr-stop" style="display:none;border:1px solid #b8cbd6;border-radius:8px;background:#fff;color:#34495e;padding:10px 14px;font:700 12px Inter,Segoe UI,Arial,sans-serif;cursor:pointer;touch-action:manipulation;">Stop Camera</button>
-          <span id="npi-qr-status" role="status" aria-live="polite" style="flex:1;min-width:180px;font:600 12px Inter,Segoe UI,Arial,sans-serif;color:#36556a;">Scan the QR code containing the Part Number.</span>
-          <div id="npi-qr-reader" style="display:none;flex:1 1 280px;width:100%;max-width:460px;min-width:240px;"></div>
-        </div>
-        """
-    )
-
     # Keep the save toolbar outside the horizontal-scroll container so it stays
     # visible while the user scrolls across to the commitment columns.
     html_parts.append(
         """
-        <div class="npi-commitment-toolbar" style="position:sticky;top:0;z-index:1000;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 12px;background:#f7fafc;border:1px solid #d8e0ea;border-bottom:0;border-radius:10px 10px 0 0;">
+        <div class="npi-commitment-toolbar" style="position:sticky;top:0;z-index:1000;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;background:#f7fafc;border:1px solid #d8e0ea;border-bottom:0;border-radius:10px 10px 0 0;">
             <span id="npi-commitment-save-status" role="status" style="flex:1;min-width:0;font:600 11px Inter,Segoe UI,Arial,sans-serif;color:#526477;">Edit any number of parts, then save all changes once.</span>
             <button type="button" id="npi-save-commitment" disabled style="flex:0 0 auto;margin-left:auto;border:0;border-radius:7px;background:#087f8c;color:#fff;padding:8px 14px;font:700 12px Inter,Segoe UI,Arial,sans-serif;cursor:pointer;opacity:.55;">Save Commitment</button>
         </div>
@@ -7291,34 +6725,6 @@ def render_drilldown(df, title):
             "</tr>"
         )
 
-    # Keep a hidden Part Detail record for every unique part in the loaded
-    # Unique-Part Dataset. This lets QR scans open a part even when current
-    # drilldown filters or pagination do not display its visible row.
-    visible_part_keys = {
-        safe_text(get_value(row, part_col)).strip()
-        for _, row in page_df.iterrows()
-    }
-    qr_hidden_count = 0
-    for _, qr_row in unique_df.iterrows():
-        qr_part_key = safe_text(get_value(qr_row, part_col)).strip()
-        if not qr_part_key or qr_part_key in visible_part_keys:
-            continue
-        qr_detail_payload = build_part_detail_payload(qr_row, qr_part_key)
-        qr_stored_commitment = commitment_lookup.get(qr_part_key, {}) or {}
-        qr_detail_payload["Commitment Part Key"] = qr_part_key
-        qr_detail_payload["Commitment Owner"] = safe_text(qr_stored_commitment.get("owner", ""))
-        qr_detail_payload["Commitment Date"] = safe_text(qr_stored_commitment.get("commitment_date", ""))
-        qr_detail_payload["Completion Date"] = safe_text(qr_stored_commitment.get("completion_date", ""))
-        qr_detail_payload["Commitment Remark"] = safe_text(qr_stored_commitment.get("remarks", ""))
-        qr_detail_json = json.dumps(qr_detail_payload, ensure_ascii=False, separators=(",", ":"))
-        html_parts.append(
-            '<tr class="npi-drilldown-row npi-part-detail-clickable npi-qr-hidden-row" '
-            f'data-part-key="{html.escape(qr_part_key, quote=True)}" '
-            f'data-part-detail="{html.escape(qr_detail_json, quote=True)}" '
-            'style="display:none!important;height:0!important;"><td></td></tr>'
-        )
-        qr_hidden_count += 1
-
     html_parts.append(
         "</tbody>"
     )
@@ -7335,6 +6741,104 @@ def render_drilldown(df, title):
         """
         <script>
         (function () {
+            const popupBridgeId = null;
+            function npiPopupMain(config) {
+                const button = document.getElementById('detail-save-commitment');
+                const status = document.getElementById('detail-save-status');
+                const fields = {
+                    owner: document.getElementById('detail-owner'),
+                    commitment_date: document.getElementById('detail-commitment-date'),
+                    completion_date: document.getElementById('detail-completion-date'),
+                    remarks: document.getElementById('detail-remark')
+                };
+                let pending = null;
+                let timer = null;
+                let channel = null;
+                let deliveryAttempt = 0;
+                let requestSequence = 0;
+                function lockInputs(locked) {
+                    Object.values(fields).forEach(function(input){ if(input) input.disabled = locked; });
+                }
+                function confirmationRetry(message) {
+                    status.textContent = message;
+                    button.textContent = 'Retry confirmation';
+                    button.disabled = false;
+                }
+                function receive(data) {
+                    if (!pending || !data || data.type !== 'npi_commitment_ack' ||
+                        data.bridge_id !== config.bridge_id || data.popup_id !== config.popup_id ||
+                        data.request_id !== pending.request_id) return;
+                    clearTimeout(timer);
+                    if (data.status === 'unknown' || data.status === 'pending') {
+                        confirmationRetry(data.message || 'Save outcome unconfirmed. Check dashboard; retry confirmation will not write again.');
+                        return;
+                    }
+                    if (data.status !== 'saved' && data.status !== 'error') return;
+                    if (data.status === 'saved') {
+                        Object.entries(data.values || {}).forEach(function(entry){
+                            if (fields[entry[0]]) fields[entry[0]].value = entry[1] == null ? '' : entry[1];
+                        });
+                        status.textContent = 'Saved';
+                    } else {
+                        status.textContent = data.message || 'Save failed. Edit or retry.';
+                    }
+                    pending = null;
+                    lockInputs(false);
+                    button.textContent = 'Save Commitment';
+                    button.disabled = false;
+                }
+                Object.values(fields).forEach(function(input){
+                    if (input) input.addEventListener('input', function(){
+                        if (!pending) status.textContent = 'Unsaved changes';
+                    });
+                });
+                window.addEventListener('message', function(event){ receive(event.data); });
+                try {
+                    if ('BroadcastChannel' in window) {
+                        channel = new BroadcastChannel('npi_commitment_channel');
+                        channel.addEventListener('message', function(event){ receive(event.data); });
+                    }
+                } catch(e) {}
+                function sendPending() {
+                    button.disabled = true;
+                    status.textContent = 'Waiting for server confirmation…';
+                    let sent = false;
+                    const message = {type:'npi_commitment_save', payload:pending, delivery_attempt:++deliveryAttempt};
+                    try {
+                        if (window.npiCommitmentBridge && !window.npiCommitmentBridge.closed) {
+                            window.npiCommitmentBridge.postMessage(message, '*');
+                            sent = true;
+                        }
+                    } catch(e) {}
+                    if (!sent && channel) {
+                        try { channel.postMessage(message); sent = true; } catch(e) {}
+                    }
+                    clearTimeout(timer);
+                    timer = setTimeout(function(){
+                        if (pending) confirmationRetry('No confirmation yet. Retry confirmation checks the same request; it does not start a new Save.');
+                    }, 30000);
+                    if (!sent) confirmationRetry('Unable to contact dashboard. Keep it open, then retry confirmation.');
+                }
+                button.addEventListener('click', function(){
+                    if (button.disabled) return;
+                    if (!pending) {
+                        deliveryAttempt = 0;
+                        pending = {
+                            request_id: config.popup_id + ':' + (++requestSequence) + ':' +
+                                ((window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() :
+                                (Date.now().toString(36) + Math.random().toString(36).slice(2))),
+                            bridge_id:config.bridge_id, popup_id:config.popup_id, part_key:config.part_key
+                        };
+                        Object.entries(fields).forEach(function(entry){ pending[entry[0]] = entry[1] ? entry[1].value : ''; });
+                        lockInputs(true);
+                    }
+                    sendPending();
+                });
+                window.addEventListener('beforeunload', function(){
+                    clearTimeout(timer);
+                    if (channel) channel.close();
+                });
+            }
             const root = document.querySelector('.npi-drilldown-wrap') || document;
             window.addEventListener('message', function (event) {
                 const data = event.data || {};
@@ -7393,8 +6897,7 @@ def render_drilldown(df, title):
                     let detail;
                     try { detail = JSON.parse(this.getAttribute('data-part-detail') || '{}'); }
                     catch (e) { return; }
-                    const popup = window.__npi_qr_preopened_popup || window.open('', '_blank', 'width=1180,height=900,resizable=yes,scrollbars=yes');
-                    window.__npi_qr_preopened_popup = null;
+                    const popup = window.open('', '_blank', 'width=1180,height=900,resizable=yes,scrollbars=yes');
                     if (!popup) {
                         alert('Part Detail pop-up was blocked by your browser. Please allow pop-ups for this app and click the row again.');
                         return;
@@ -7428,47 +6931,20 @@ def render_drilldown(df, title):
                         .eyebrow{font-size:10px;font-weight:800;letter-spacing:1.6px;color:#79d4e4;text-transform:uppercase;margin-bottom:7px}.title{font-size:27px;font-weight:800;line-height:1.2;margin:0;overflow-wrap:anywhere;color:#fff}.subtitle{color:#d3e0ec;font-size:12px;margin-top:7px}
                         .close{border:1px solid rgba(255,255,255,.3);background:rgba(255,255,255,.1);color:#fff;border-radius:9px;padding:9px 13px;font-weight:700;cursor:pointer;white-space:nowrap}.close:hover{background:rgba(255,255,255,.2)}.detail-layout{display:grid;grid-template-columns:minmax(390px,1.04fr) minmax(470px,1fr);gap:14px;align-items:stretch;flex:1;min-height:0}.right-column{display:flex;flex-direction:column;gap:10px;min-width:0;min-height:0;overflow:hidden}.left-column{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0;overflow:hidden}.left-column>.card{flex:1;min-height:0;overflow:hidden}.detail-layout>.card{margin-bottom:0;min-width:0}.picture-card,.card{background:#fff;border:1px solid #dfe7f0;border-radius:14px;box-shadow:0 5px 18px rgba(15,23,42,.045)}
                         .picture-card{min-height:170px;padding:10px;display:grid;grid-template-columns:minmax(0,1fr) minmax(145px,.72fr);gap:12px;align-items:stretch;background:linear-gradient(145deg,#fff,#f5f9fc);overflow:hidden}.picture-stage{min-width:0;display:flex;align-items:center;justify-content:center;border-radius:10px;background:#fff;border:1px solid #edf1f6;padding:8px}.part-picture{display:block;max-width:100%;max-height:145px;object-fit:contain}.picture-placeholder{min-height:140px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px;text-align:center}.picture-stats{display:grid;grid-template-rows:1fr 1fr;gap:10px;min-width:0}.stat-tile{display:flex;flex-direction:column;justify-content:center;padding:12px 13px;border-radius:11px;background:linear-gradient(140deg,#20354f,#2c5873);color:#fff;min-width:0}.stat-tile.qty{background:linear-gradient(140deg,#087f9b,#10a4b7)}.stat-label{font-size:10px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;color:#d5e7ef;margin-bottom:8px}.stat-value{font-size:clamp(23px,2.5vw,34px);font-weight:850;line-height:1.05;overflow-wrap:anywhere;color:#fff}.process-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:0 0 7px}.process-stat{padding:6px 8px;border-radius:10px;border:1px solid #e0eaf1;background:#f5f9fc}.process-stat .label{margin-bottom:3px}.process-stat .value{font-size:15px;font-weight:800;color:#20354f}
-                        .card{padding:16px;margin-bottom:0}.section-title{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:800;color:#20354f;margin:0 0 8px}.section-title:before{content:'';width:4px;height:18px;border-radius:4px;background:#0e9ab3}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.field{padding:9px 10px;border:1px solid #e8eef5;border-radius:9px;background:#f8fafc;min-width:0}.label{font-size:9px;text-transform:uppercase;letter-spacing:.7px;color:#718096;font-weight:800;margin-bottom:5px}.value{font-size:12px;font-weight:650;color:#26364a;overflow-wrap:anywhere;min-height:15px}.process-card{padding:10px 11px;position:relative;display:flex;flex-direction:column;flex:1 1 auto;min-height:0;overflow:hidden}.process-meta{font-size:10px;color:#718096;margin:-5px 0 5px}.routing-wrap{flex:1 1 auto;height:0;max-height:none;min-height:0;overflow:auto;border:1px solid #e1e8f0;border-radius:10px;scrollbar-width:thin;scrollbar-color:#c2cedb #f4f7fa}.routing{width:100%;border-collapse:separate;border-spacing:0;font-size:11px;overflow:hidden}.routing th{position:sticky;top:0;z-index:2;background:#20354f;color:#fff;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.45px;padding:6px 7px;white-space:normal}.routing td{padding:5px 7px;border-top:1px solid #e8edf3;background:#fff;vertical-align:top}.routing tr:nth-child(even) td{background:#f7f9fc}.routing tbody tr:hover td{background:#eaf6fa}.routing .step{width:38px;color:#0e8aa3;font-weight:800;text-align:center}.routing td.actual-late{background:#fee2e2!important;color:#b91c1c;font-weight:800;box-shadow:inset 3px 0 0 #dc2626}.empty{text-align:center;color:#94a3b8;padding:24px!important}.footer{font-size:9px;color:#8190a3;text-align:right;margin-top:5px;flex-shrink:0}@media(max-width:980px){body{padding:10px}.detail-layout{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}.process-card{position:relative}.routing-wrap{max-height:none;min-height:0}.top{padding:10px 13px;margin-bottom:9px}.title{font-size:22px}.card{padding:12px}}@media(max-width:650px){.detail-layout{grid-template-columns:1fr 1fr;gap:8px}.picture-card{grid-template-columns:1fr}.picture-stage{min-height:100px}.picture-stats{grid-template-columns:1fr;grid-template-rows:auto}.stat-value{font-size:20px}.grid{grid-template-columns:1fr}.process-stats{grid-template-columns:1fr}.action-form{grid-template-columns:1fr}.action-form .remark-field{grid-column:auto}.routing th,.routing td{padding:6px 5px;font-size:9px}.section-title{font-size:12px}.card,.process-card{padding:9px}}
+                        .card{padding:16px;margin-bottom:0}.section-title{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:800;color:#20354f;margin:0 0 8px}.section-title:before{content:'';width:4px;height:18px;border-radius:4px;background:#0e9ab3}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.field{padding:9px 10px;border:1px solid #e8eef5;border-radius:9px;background:#f8fafc;min-width:0}.label{font-size:9px;text-transform:uppercase;letter-spacing:.7px;color:#718096;font-weight:800;margin-bottom:5px}.value{font-size:12px;font-weight:650;color:#26364a;overflow-wrap:anywhere;min-height:15px}.process-card{padding:10px 11px;position:relative;display:flex;flex-direction:column;flex:1 1 auto;min-height:0;overflow:hidden}.process-meta{font-size:10px;color:#718096;margin:-5px 0 5px}.routing-wrap{flex:1 1 auto;height:0;max-height:none;min-height:0;overflow:auto;border:1px solid #e1e8f0;border-radius:10px;scrollbar-width:thin;scrollbar-color:#c2cedb #f4f7fa}.routing{width:100%;border-collapse:separate;border-spacing:0;font-size:11px;overflow:hidden}.routing th{position:sticky;top:0;z-index:2;background:#20354f;color:#fff;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.45px;padding:6px 7px;white-space:normal}.routing td{padding:5px 7px;border-top:1px solid #e8edf3;background:#fff;vertical-align:top}.routing tr:nth-child(even) td{background:#f7f9fc}.routing tbody tr:hover td{background:#eaf6fa}.routing .step{width:38px;color:#0e8aa3;font-weight:800;text-align:center}.routing td.actual-late{background:#fee2e2!important;color:#b91c1c;font-weight:800;box-shadow:inset 3px 0 0 #dc2626}.empty{text-align:center;color:#94a3b8;padding:24px!important}.footer{font-size:9px;color:#8190a3;text-align:right;margin-top:5px;flex-shrink:0}@media(max-width:980px){body{padding:10px}.detail-layout{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}.process-card{position:relative}.routing-wrap{max-height:none;min-height:0}.top{padding:10px 13px;margin-bottom:9px}.title{font-size:22px}.card{padding:12px}}@media(max-width:650px){body{padding:8px;overflow:auto}.page{height:auto;min-height:100vh;overflow:visible}.detail-layout{display:flex;flex-direction:column;gap:10px;min-height:0;overflow:visible}.left-column,.right-column{overflow:visible;min-height:0}.left-column>.card{flex:0 0 auto;overflow:visible}.picture-card{grid-template-columns:1fr}.picture-stage{min-height:100px}.picture-stats{grid-template-columns:1fr 1fr;grid-template-rows:auto}.stat-value{font-size:20px}.grid{grid-template-columns:1fr}.process-stats{grid-template-columns:1fr}.process-card{flex:0 0 auto;min-height:420px;overflow:visible}.routing-wrap{height:auto;max-height:55vh;min-height:220px;overflow:auto;-webkit-overflow-scrolling:touch}.action-form{grid-template-columns:1fr}.action-form .remark-field{grid-column:auto}.routing th,.routing td{padding:7px 6px;font-size:10px}.section-title{font-size:13px}.card,.process-card{padding:9px}.top{align-items:flex-start;gap:8px}.top .close{min-height:40px;flex-shrink:0}}
                         @media(max-width:520px){.picture-card{grid-template-columns:1fr}.picture-stage{min-height:150px}.picture-stats{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:auto}.stat-value{font-size:25px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.card,.process-card{padding:12px}.routing th,.routing td{padding:8px 7px}}
                     </style></head><body><main class="page"><header class="top"><div><div class="eyebrow">NPI Control Tower · Part Profile</div><h1 class="title">${esc(detail['Part Number'])}</h1><div class="subtitle">Purchase Order: ${esc(detail['PO Number'])} &nbsp;·&nbsp; Job: ${esc(detail['Job Number'])}</div></div><button class="close" onclick="window.close()">✕ Close</button></header>
                     <section class="detail-layout"><div class="left-column"><div class="picture-card"><div class="picture-stage">${picture}</div><div class="picture-stats"><div class="stat-tile qty"><div class="stat-label">Qty</div><div class="stat-value">${esc(detail.Qty)}</div></div><div class="stat-tile"><div class="stat-label">Engineer</div><div class="stat-value" style="font-size:clamp(17px,1.8vw,25px)">${esc(detail.Engineer)}</div></div></div></div><section class="card"><h2 class="section-title">Part Informations</h2><div class="grid">${field('PO Number',detail['PO Number'])}${field('Order Date',detail['Order Date'])}${field('Exwork Date',detail['Exwork Date'])}${field('Job Number',detail['Job Number'])}${field('Nesting Number',detail['Nesting Number'] === '' || detail['Nesting Number'] == null ? '' : (Number.isFinite(Number(detail['Nesting Number'])) ? String(Math.trunc(Number(detail['Nesting Number']))) : detail['Nesting Number']))}${field('Material',detail.Material)}${field('Plating',detail.Plating)}${field('Finishing',detail.Finishing)}${field('Subpart 2D Rev',detail['Subpart 2D Rev'])}${field('Subpart 3D Rev',detail['Subpart 3D Rev'])}${field('Subpart KK Rev',detail['Subpart KK Rev'])}</div></section></div>
                     <div class="right-column"><section class="card process-card"><h2 class="section-title">Process</h2><div class="process-meta">${routing.length} process step(s) · Scroll within this panel to view all steps</div><div class="process-stats"><div class="process-stat"><div class="label">Delay Days</div><div class="value">${esc(detail['Delay Days'])}</div></div><div class="process-stat"><div class="label">Aging</div><div class="value">${esc(detail.Aging)}</div></div><div class="process-stat"><div class="label">First Process Plan Date</div><div class="value">${esc(detail['First Process Plan Date'])}</div></div></div><div class="routing-wrap"><table class="routing"><thead><tr><th style="width:42px">Step</th><th style="width:31%">Operation</th><th>Plan Start Date</th><th>Actual Start Date</th></tr></thead><tbody>${routingRows}</tbody></table></div><div class="footer">Actual Start Date turns red when it is later than Plan Start Date</div></section><section class="card action-card"><h2 class="section-title">Commitment & Remarks</h2><div class="action-form"><label>Owner<input type="text" id="detail-owner" placeholder="Enter owner" value="${esc(detail['Commitment Owner'] || '')}"></label><label>Commitment Date<input type="date" id="detail-commitment-date" value="${esc(detail['Commitment Date'] || '')}"></label><label>Completion Date<input type="date" id="detail-completion-date" value="${esc(detail['Completion Date'] || '')}"></label><label class="remark-field">Remark<textarea id="detail-remark" rows="3" placeholder="Enter remark">${esc(detail['Commitment Remark'] || '')}</textarea></label></div><div class="action-actions"><button id="detail-save-commitment" class="save-commitment">Save Commitment</button><span id="detail-save-status" role="status"></span></div><div class="action-note">Saved records are shared with other approved users. Previous values are retained for audit.</div></section></div></section></main><style>.action-card{margin-top:0;flex:0 0 auto;overflow:hidden;padding:12px}.action-form{display:grid;grid-template-columns:1fr 1fr;gap:7px}.action-form label{display:flex;flex-direction:column;gap:6px;font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:#718096}.action-form input,.action-form textarea{width:100%;font:500 12px Inter,Segoe UI,Arial,sans-serif;color:#26364a;background:#f8fafc;border:1px solid #dbe5ef;border-radius:8px;padding:7px 8px;outline:none}.action-form input:focus,.action-form textarea:focus{border-color:#0e9ab3;box-shadow:0 0 0 3px rgba(14,154,179,.12)}.action-form .remark-field{grid-column:1/-1}.action-form textarea{resize:none;min-height:46px;height:46px}.action-note{margin-top:6px;font-size:10px;color:#8190a3}.action-actions{display:flex;align-items:center;gap:12px;margin-top:8px}.save-commitment{border:0;border-radius:9px;background:#087f8c;color:#fff;padding:10px 16px;font-weight:800;cursor:pointer}.save-commitment:disabled{opacity:.65;cursor:wait}#detail-save-status{font-size:11px;color:#087f8c;font-weight:700}@media(max-width:520px){.process-stats{grid-template-columns:1fr}.action-form{grid-template-columns:1fr}}</style></body></html>`);
                     popup.document.close();
-                    const ownerInput = popup.document.getElementById('detail-owner');
-                    const commitmentInput = popup.document.getElementById('detail-commitment-date');
-                    const completionInput = popup.document.getElementById('detail-completion-date');
-                    const remarkInput = popup.document.getElementById('detail-remark');
-                    const saveButton = popup.document.getElementById('detail-save-commitment');
-                    const status = popup.document.getElementById('detail-save-status');
-                    if (saveButton) saveButton.addEventListener('click', function () {
-                        saveButton.disabled = true;
-                        status.textContent = 'Sending save request…';
-                        const payload = {
-                            request_id: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)),
-                            part_key: String(detail['Commitment Part Key'] || detail['Part Number'] || '').trim(),
-                            owner: ownerInput ? ownerInput.value : '',
-                            commitment_date: commitmentInput ? commitmentInput.value : '',
-                            completion_date: completionInput ? completionInput.value : '',
-                            remarks: remarkInput ? remarkInput.value : ''
-                        };
-                        let sent = false;
-                        try {
-                            if ('BroadcastChannel' in window) {
-                                const channel = new BroadcastChannel('npi_commitment_channel');
-                                channel.postMessage({type: 'npi_commitment_save', payload: payload});
-                                channel.close();
-                                sent = true;
-                            }
-                        } catch (e) {}
-                        if (!sent && window.opener && !window.opener.closed) {
-                            try {
-                                window.opener.postMessage({type: 'npi_commitment_save', payload: payload}, '*');
-                                sent = true;
-                            } catch (e) {}
-                        }
-                        status.textContent = sent ? 'Save request sent. Check the dashboard for confirmation.' : 'Unable to send the save request. Keep this window open and try again.';
-                        setTimeout(function () { saveButton.disabled = false; }, 2500);
-                    });
+                    popup.npiCommitmentBridge = window.parent;
+                    const popupScript = popup.document.createElement('script');
+                    popupScript.textContent = '(' + npiPopupMain.toString() + ')(' + JSON.stringify({
+                        bridge_id: popupBridgeId,
+                        popup_id: makeRequestId(),
+                        part_key: String(detail['Commitment Part Key'] || detail['Part Number'] || '').trim()
+                    }) + ');';
+                    popup.document.body.appendChild(popupScript);
                 });
             });
             if (saveButton) saveButton.addEventListener('click', function () {
@@ -7510,104 +6986,67 @@ def render_drilldown(df, title):
                 emitCommitmentSave(payload);
                 dirtyRows.clear();
             });
-            // QR Scanner V1. The hidden rows above are sourced from the complete
-            // Unique-Part Dataset, so current filters and pagination do not limit lookup.
-            const qrStart = document.getElementById('npi-qr-start');
-            const qrStop = document.getElementById('npi-qr-stop');
-            const qrStatus = document.getElementById('npi-qr-status');
-            const qrReader = document.getElementById('npi-qr-reader');
-            let qrScanner = null;
-            let qrBusy = false;
-            const normalizePartKey = value => String(value == null ? '' : value).trim().replace(/\\s+/g, ' ').toUpperCase();
-            function qrSetStatus(message, isError) {
-                if (!qrStatus) return;
-                qrStatus.textContent = message;
-                qrStatus.style.color = isError ? '#b42318' : '#36556a';
-            }
-            async function stopQrScanner() {
-                if (qrScanner) {
-                    try { if (qrScanner.isScanning) await qrScanner.stop(); } catch (e) {}
-                    try { await qrScanner.clear(); } catch (e) {}
-                    qrScanner = null;
-                }
-                if (qrReader) qrReader.style.display = 'none';
-                if (qrStop) qrStop.style.display = 'none';
-                if (qrStart) qrStart.style.display = 'inline-block';
-            }
-            if (qrStart) qrStart.addEventListener('click', async function () {
-                if (qrBusy) return;
-                qrBusy = true;
-                // Open synchronously in the click gesture; the scan callback is asynchronous.
-                window.__npi_qr_preopened_popup = window.open('', '_blank', 'width=1180,height=900,resizable=yes,scrollbars=yes');
-                if (!window.__npi_qr_preopened_popup) {
-                    qrBusy = false;
-                    qrSetStatus('Browser blocked the popup. Allow pop-ups for this app, then scan again.', true);
-                    return;
-                }
-                try { window.__npi_qr_preopened_popup.document.open(); window.__npi_qr_preopened_popup.document.write('<!doctype html><title>NPI Part Detail</title><p style="font:16px Arial;padding:24px">Waiting for QR scan…</p>'); window.__npi_qr_preopened_popup.document.close(); } catch (e) {}
-                if (typeof Html5Qrcode === 'undefined') {
-                    try { window.__npi_qr_preopened_popup.close(); } catch (e) {}
-                    window.__npi_qr_preopened_popup = null;
-                    qrBusy = false;
-                    qrSetStatus('QR scanner library could not load. Check internet access and refresh the app.', true);
-                    return;
-                }
-                qrSetStatus('Requesting camera permission…');
-                qrReader.style.display = 'block';
-                qrStart.style.display = 'none';
-                qrStop.style.display = 'inline-block';
-                try {
-                    qrScanner = new Html5Qrcode('npi-qr-reader');
-                    const config = { fps: 10, qrbox: { width: 230, height: 230 }, aspectRatio: 1.0 };
-                    await qrScanner.start({ facingMode: 'environment' }, config, async function (decodedText) {
-                        if (!qrBusy) return;
-                        qrBusy = false;
-                        const scannedKey = normalizePartKey(decodedText);
-                        await stopQrScanner();
-                        const match = Array.from(root.querySelectorAll('tr.npi-part-detail-clickable')).find(row => normalizePartKey(row.getAttribute('data-part-key')) === scannedKey);
-                        if (!match) {
-                            if (window.__npi_qr_preopened_popup) { try { window.__npi_qr_preopened_popup.close(); } catch (e) {} }
-                            window.__npi_qr_preopened_popup = null;
-                            qrSetStatus('Part Number Not Found: ' + String(decodedText).trim(), true);
-                            return;
-                        }
-                        qrSetStatus('Part Number found: ' + String(match.getAttribute('data-part-key')) + '. Opening Part Detail…');
-                        match.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));
-                        setTimeout(function () { if (qrStatus) qrSetStatus('Part Detail opened for ' + String(match.getAttribute('data-part-key')) + '.'); }, 250);
-                    }, function () { /* Ignore intermediate camera frames with no QR code. */ });
-                    qrSetStatus('Camera ready. Point it at the job traveller QR code.');
-                } catch (error) {
-                    qrBusy = false;
-                    await stopQrScanner();
-                    if (window.__npi_qr_preopened_popup) { try { window.__npi_qr_preopened_popup.close(); } catch (e) {} }
-                    window.__npi_qr_preopened_popup = null;
-                    qrSetStatus('Unable to start camera. Check browser camera permission and try Chrome/Firefox again. ' + (error && error.message ? error.message : ''), true);
-                }
-            });
-            if (qrStop) qrStop.addEventListener('click', async function () {
-                qrBusy = false;
-                await stopQrScanner();
-                if (window.__npi_qr_preopened_popup) { try { window.__npi_qr_preopened_popup.close(); } catch (e) {} }
-                window.__npi_qr_preopened_popup = null;
-                qrSetStatus('Scan stopped.');
-            });
             updateSaveButton();
         })();
         </script>
-        """
+        """.replace("const popupBridgeId = null;", "const popupBridgeId = " + json.dumps(popup_bridge_id) + ";")
     )
 
     component_event = _npi_drilldown_component(
         html_content="".join(html_parts),
         height=760,
         key="npi_drilldown_commitment_bridge",
+        # Preserve scroll only while the displayed page and part order are unchanged.
+        viewport_key=hashlib.sha256(json.dumps(
+            [str(customer_display), title, selected_current_process, page,
+             [safe_text(value) for value in page_df[part_col].tolist()]
+             if part_col and part_col in page_df.columns else []],
+            ensure_ascii=True,
+        ).encode("utf-8")).hexdigest(),
+        popup_bridge_id=popup_bridge_id,
+        popup_results=list(popup_requests.values()),
         default=None,
     )
     if isinstance(component_event, dict) and component_event.get("type") == "npi_commitment_save":
         event_payload = component_event.get("payload")
         if isinstance(event_payload, dict):
             event_request_id = safe_text(event_payload.get("request_id"))
-            if event_request_id and event_request_id != st.session_state.get("_npi_last_commitment_request_id"):
+            if event_payload.get("popup_id"):
+                # One immutable outcome per popup request, including indeterminate RPC results.
+                # Never replay a write after a timeout or a later duplicate delivery.
+                if (event_request_id and event_payload.get("bridge_id") == popup_bridge_id
+                        and event_request_id not in popup_requests):
+                    popup_part = safe_text(event_payload.get("part_key")).strip()
+                    popup_changes = {
+                        "owner": safe_text(event_payload.get("owner")).strip() or None,
+                        "commitment_date": safe_text(event_payload.get("commitment_date")).strip() or None,
+                        "completion_date": safe_text(event_payload.get("completion_date")).strip() or None,
+                        "remarks": safe_text(event_payload.get("remarks")),
+                    }
+                    outcome = {
+                        "type": "npi_commitment_ack", "bridge_id": popup_bridge_id,
+                        "popup_id": safe_text(event_payload.get("popup_id")),
+                        "request_id": event_request_id, "status": "unknown",
+                        "message": "Save outcome unconfirmed. Check dashboard before another Save; retry confirmation will not write again.",
+                    }
+                    popup_requests[event_request_id] = outcome
+                    if not popup_part:
+                        outcome.update(status="error", message="Part key is empty. Nothing was saved.")
+                    else:
+                        try:
+                            save_supabase_commitment_patch(popup_part, popup_changes, user_id=current_user_id)
+                        except PermissionError:
+                            # The secure store raises this before its RPC, so a fresh retry is safe.
+                            outcome.update(status="error", message="Access denied. Nothing was saved. Check login/approval, then retry.")
+                        except Exception:
+                            # A transport failure can occur after DB commit. Do not claim failure,
+                            # mark success, or retry the RPC without database idempotency support.
+                            pass
+                        else:
+                            outcome.update(status="saved", message="Saved", values=popup_changes)
+                            st.session_state["_npi_commitment_success_message"] = "Commitment saved for 1 part(s)."
+                    st.rerun()
+            elif event_request_id and event_request_id != st.session_state.get("_npi_last_commitment_request_id"):
                 raw_records = event_payload.get("records")
                 if not isinstance(raw_records, list):
                     raw_records = [event_payload]
@@ -7632,13 +7071,19 @@ def render_drilldown(df, title):
                     if not saved_parts:
                         raise ValueError("No valid part records were included in the save request.")
                     st.session_state["_npi_last_commitment_request_id"] = event_request_id
-                    st.success(f"Commitment saved for {len(saved_parts)} part(s).")
+                    st.session_state["_npi_commitment_success_message"] = (
+                        f"Commitment saved for {len(saved_parts)} part(s)."
+                    )
                 except Exception as commitment_error:
                     st.session_state["_npi_last_commitment_request_id"] = event_request_id
                     st.error(
                         f"Unable to save commitment batch. Saved before error: "
                         f"{', '.join(saved_parts) or 'none'}. Error: {commitment_error}"
                     )
+                else:
+                    # Read Latest and rebuild component HTML after successful persistence.
+                    # The recorded request ID prevents replay from saving twice.
+                    st.rerun()
 
 
 # ============================================================
@@ -7718,6 +7163,24 @@ def render_control_tower():
         }
         div[data-testid="stSelectbox"] label {
             display: none;
+        }
+        @media (max-width: 760px) {
+            [data-testid="stMainBlockContainer"] { padding: 0.65rem 0.65rem 2rem !important; }
+            .npi-control-tower-top-title { font-size: 22px !important; white-space: normal !important; overflow-wrap: anywhere; }
+            .npi-control-tower-top-meta { font-size: 12px !important; white-space: normal !important; }
+            [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.5rem !important; }
+            [data-testid="stHorizontalBlock"] > [data-testid="column"] { min-width: min(100%, 260px) !important; flex: 1 1 100% !important; width: 100% !important; }
+            [data-testid="stButton"] button, [data-testid="stDownloadButton"] button, [data-testid="stSelectbox"] div[data-baseweb="select"] { min-height: 42px !important; }
+            [data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea, [data-testid="stDateInput"] input { font-size: 16px !important; }
+            div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
+            div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] > [data-testid="column"] { min-width: 0 !important; flex: 0 1 auto !important; width: auto !important; }
+            div[class*="st-key-drilldown_compact_header"] [data-testid="stButton"] button,
+            div[class*="st-key-drilldown_compact_header"] [data-testid="stPopover"] button { min-height: 38px !important; height: auto !important; white-space: normal !important; }
+            [data-testid="stFileUploader"] section { padding: 0.65rem !important; }
+        }
+        @media (max-width: 420px) {
+            .npi-control-tower-top-title { font-size: 20px !important; }
+            [data-testid="stMainBlockContainer"] { padding-left: 0.45rem !important; padding-right: 0.45rem !important; }
         }
         </style>
         """,

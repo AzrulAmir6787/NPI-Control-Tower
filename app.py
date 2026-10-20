@@ -2231,6 +2231,129 @@ def build_donut_svg(
 # EXECUTIVE STATUS
 # ============================================================
 
+def _batch_a_touch_script(kind, root_selector):
+    """Scoped presentation-only touch routing; no data or persistence operations."""
+    return r"""
+(function(win,config){
+    'use strict';
+    const doc=win.document, key='__npiBatchATouch_'+config.kind;
+    if(win[key] && win[key].dispose)win[key].dispose();
+    let gesture=null,blockUntil=0,inertia=0,frameTime=0,velocity=0,resizeObserver=null;
+    const removals=[];
+    function listen(target,type,fn,options){if(!target || !target.addEventListener)return;target.addEventListener(type,fn,options);removals.push(()=>target.removeEventListener(type,fn,options));}
+    function root(){return doc.querySelector(config.root);}
+    function stopInertia(){if(inertia)win.cancelAnimationFrame(inertia);inertia=0;velocity=0;}
+    function host(){let current=win;for(let i=0;i<6;i++){try{if(current.parent===current)break;void current.parent.document;current=current.parent;}catch(e){break;}}return current;}
+    function canScroll(element,view){
+        if(!element || element.nodeType!==1)return false;
+        let overflow='';try{overflow=view.getComputedStyle(element).overflowY;}catch(e){}
+        const main=element.matches && element.matches('[data-testid="stMain"],section.main');
+        return (main || /auto|scroll/.test(overflow)) && element.scrollHeight>element.clientHeight+1;
+    }
+    function scrollChain(target){
+        const chain=[],seen=new Set();let view=win,node=target;
+        for(let depth=0;depth<7;depth++){
+            for(let el=node;el;el=el.parentElement){
+                if(!seen.has(el) && canScroll(el,view)){seen.add(el);chain.push(el);}
+            }
+            const scrolling=view.document.scrollingElement;
+            if(scrolling && !seen.has(scrolling) && !/hidden|clip/.test(view.getComputedStyle(scrolling).overflowY) && scrolling.scrollHeight>scrolling.clientHeight+1){seen.add(scrolling);chain.push(scrolling);}
+            try{if(view.parent===view)break;node=view.frameElement;view=view.parent;void view.document;}catch(e){break;}
+        }
+        return chain;
+    }
+    function consume(chain,delta){
+        let remaining=delta;
+        chain.forEach(function(el){
+            if(Math.abs(remaining)<0.1)return;
+            const before=el.scrollTop,limit=Math.max(0,el.scrollHeight-el.clientHeight);
+            el.scrollTop=Math.max(0,Math.min(limit,before+remaining));remaining-=el.scrollTop-before;
+        });
+        return delta-remaining;
+    }
+    function restoreAccidentalFocus(g){
+        const active=doc.activeElement;
+        if(active && active!==g.active && active.matches && active.matches('input,textarea,select') && g.target.contains && g.target.contains(active)){
+            active.blur();
+            try{if(g.active && g.active.focus)g.active.focus({preventScroll:true});}catch(e){}
+        }
+    }
+    function start(event){
+        stopInertia();blockUntil=0;
+        const area=root(),point=event.touches && event.touches[0];
+        if(!area || !point || event.touches.length!==1 || !area.contains(event.target) ||
+            (event.target.closest && event.target.closest('#npi-dashboard-drilldown-boundary,[role="separator"]'))){gesture=null;return;}
+        gesture={x:point.clientX,y:point.clientY,lastY:point.clientY,lastTime:Date.now(),axis:null,moved:false,target:event.target,
+            active:doc.activeElement,chain:scrollChain(event.target)};
+    }
+    function move(event){
+        const g=gesture;if(!g)return;
+        if(!event.touches || event.touches.length!==1){gesture=null;stopInertia();return;}
+        const point=event.touches[0],dx=point.clientX-g.x,dy=point.clientY-g.y;
+        const ax=Math.abs(dx),ay=Math.abs(dy);
+        if(Math.max(ax,ay)>=10){g.moved=true;blockUntil=Date.now()+700;restoreAccidentalFocus(g);}
+        if(!g.axis && Math.max(ax,ay)>=6)g.axis=ax>ay*1.1?'x':ay>ax*1.1?'y':null;
+        // Let the browser own horizontal table swipes and multi-touch zoom.
+        // Keep early vertical motion cancellable until direction is established.
+        if(g.axis==='x'){g.lastY=point.clientY;return;}
+        if(g.axis==='y' || (!g.axis && ay>ax && ay>1)){
+            if(event.cancelable && g.chain.length){
+                event.preventDefault();
+                const now=Date.now(),delta=g.lastY-point.clientY,elapsed=Math.max(8,now-g.lastTime);
+                const consumed=consume(g.chain,delta);
+                velocity=0.55*velocity+0.45*(consumed/elapsed);
+                g.lastTime=now;
+            }
+        }
+        g.lastY=point.clientY;
+    }
+    function finish(event){
+        const g=gesture;gesture=null;if(!g)return;
+        if(g.moved){blockUntil=Date.now()+700;restoreAccidentalFocus(g);}
+        if(event.type==='touchcancel' || !g.moved || g.axis!=='y' || Math.abs(velocity)<0.12){stopInertia();return;}
+        const chain=g.chain;let speed=Math.max(-2.5,Math.min(2.5,velocity));frameTime=0;
+        function tick(now){
+            const dt=frameTime?Math.min(32,now-frameTime):16;frameTime=now;
+            const used=consume(chain,speed*dt);speed*=Math.exp(-dt/150);
+            if(Math.abs(speed)>0.03 && Math.abs(used)>0.1)inertia=win.requestAnimationFrame(tick);else inertia=0;
+        }
+        inertia=win.requestAnimationFrame(tick);
+    }
+    function guardClick(event){
+        if(Date.now()<blockUntil){event.preventDefault();event.stopImmediatePropagation();}
+    }
+    function frozenColumns(){
+        if(config.kind!=='table')return;
+        const area=root();if(!area)return;
+        const width=area.clientWidth,band=Number(area.dataset.npiFreezeWidth)||520;
+        const outer=host(),viewport=outer.visualViewport;
+        const coarse=!!(outer.matchMedia && outer.matchMedia('(pointer: coarse)').matches);
+        const shortSide=Math.min(viewport?viewport.width:outer.innerWidth,viewport?viewport.height:outer.innerHeight);
+        const phone=width<=760 || (coarse && shortSide<=500 && width<=1100);
+        const sufficient=width-band>=320 && band<=width*0.45;
+        area.dataset.npiFreeze=!phone && (width>=1200 || sufficient)?'on':'off';
+    }
+    function resized(){gesture=null;stopInertia();frozenColumns();}
+    listen(doc,'touchstart',start,{capture:true,passive:true});
+    listen(doc,'touchmove',move,{capture:true,passive:false});
+    listen(doc,'touchend',finish,{capture:true,passive:true});
+    listen(doc,'touchcancel',finish,{capture:true,passive:true});
+    listen(doc,'click',guardClick,true);listen(doc,'dblclick',guardClick,true);
+    listen(win,'pointerdown',function(event){if(event.pointerType==='mouse'){stopInertia();blockUntil=0;}},true);
+    listen(win,'resize',resized);listen(win,'orientationchange',resized);
+    const outer=host();listen(outer,'resize',resized);listen(outer.visualViewport,'resize',resized);
+    if(config.kind==='table' && win.ResizeObserver && root()){
+        resizeObserver=new win.ResizeObserver(frozenColumns);resizeObserver.observe(root());
+    }
+    frozenColumns();
+    const dispose=function(){stopInertia();removals.forEach(fn=>fn());if(resizeObserver)resizeObserver.disconnect();};
+    listen(win,'pagehide',dispose,{once:true});
+    win[key]={dispose};
+})(window,__CONFIG__);
+
+""".replace("__CONFIG__", json.dumps({"kind": kind, "root": root_selector}))
+
+
 def render_executive_status(
     unique_df,
     delay_bucket_summary=None,
@@ -3633,7 +3756,7 @@ body {{
 
 /* Standardized layout V5. Geometry is shared with the native Enquiry form. */
 .npi-floating-stage {{ height:624px; overflow:hidden; }}
-#npi-dashboard-scroll {{ position:absolute; inset:0 0 18px; overflow:auto; scrollbar-gutter:stable; overscroll-behavior:contain; }}
+#npi-dashboard-scroll {{ position:absolute; inset:0 0 18px; overflow:auto; scrollbar-gutter:stable; overscroll-behavior:auto; }}
 #npi-layout-canvas {{ position:relative; width:100%; min-height:1px; }}
 .npi-floating-panel {{ min-width:0; min-height:120px; border:1px solid #d8e2ed; border-radius:12px; box-shadow:0 3px 10px rgba(25,48,76,.07); }}
 .npi-enquiry-slot {{ position:absolute; pointer-events:none; }}
@@ -3661,6 +3784,11 @@ body {{
 .npi-floating-stage[data-layout-mode="mobile"] .npi-floating-panel button {{ min-height:42px; touch-action:manipulation; }}
 .npi-floating-stage[data-layout-mode="mobile"] .npi-float-legend {{ min-height:38px; }}
 
+
+@media(pointer:coarse) {{
+ .npi-floating-panel {{ resize:none !important; touch-action:pan-x pan-y; }}
+ .npi-floating-header {{ cursor:default !important; }}
+}}
 
 </style>
 
@@ -3946,7 +4074,7 @@ body {{
         const handle=panel.querySelector('[data-drag-handle]');if(!handle)return;
         let drag=null;
         handle.addEventListener('pointerdown',function(event){{
-            if(currentMode!=='desktop' || event.button!==0 || event.target.closest('button'))return;
+            if(currentMode!=='desktop' || event.pointerType!=='mouse' || event.button!==0 || event.target.closest('button'))return;
             const r=currentLayout.rects[panel.dataset.layoutId];
             drag={{x:event.clientX,y:event.clientY,left:r.left,top:r.top}};gestureDepth++;
             try{{handle.setPointerCapture(event.pointerId);}}catch(e){{}}event.preventDefault();
@@ -3961,7 +4089,7 @@ body {{
     function enableResizeSaving(panel){{
         let resizing=false;
         panel.addEventListener('pointerdown',function(event){{
-            if(currentMode!=='desktop')return;
+            if(currentMode!=='desktop' || event.pointerType!=='mouse')return;
             const r=panel.getBoundingClientRect();
             if(event.clientX>=r.right-18 && event.clientY>=r.bottom-18){{resizing=true;gestureDepth++;}}
         }});
@@ -3973,9 +4101,20 @@ body {{
     }}
     window.__npiDashboardLayoutV5={{owner:LAYOUT_OWNER,getLayout:()=>currentLayout,updatePanel,resetLayout,
         beginGesture:()=>gestureDepth++,endGesture:()=>{{gestureDepth=Math.max(0,gestureDepth-1);}},sync:publishLayout}};
-    window.addEventListener('resize',function(){{
-        clearTimeout(resizeTimer);resizeTimer=setTimeout(function(){{if(!gestureDepth)reflowLayout();}},80);
-    }});
+    function queueResponsiveReflow(){{
+        clearTimeout(resizeTimer);resizeTimer=setTimeout(function(){{
+            const scroll=document.getElementById('npi-dashboard-scroll');
+            if(!gestureDepth && scroll && currentLayout && Math.abs(scroll.clientWidth-currentLayout.width)>1)reflowLayout();
+            else publishLayout();
+        }},100);
+    }}
+    window.addEventListener('resize',queueResponsiveReflow);
+    window.addEventListener('orientationchange',queueResponsiveReflow);
+    let viewportSource=null;
+    try{{viewportSource=window.parent.visualViewport;if(viewportSource)viewportSource.addEventListener('resize',queueResponsiveReflow);}}catch(e){{}}
+    window.addEventListener('pagehide',function(){{
+        clearTimeout(resizeTimer);if(viewportSource)viewportSource.removeEventListener('resize',queueResponsiveReflow);
+    }},{{once:true}});
 
     /* ========================================================
        FIND STREAMLIT BRIDGE BUTTON
@@ -4766,6 +4905,7 @@ body {{
     # 8. RENDER
     # ============================================================
 
+    floating_html += "<script>" + _batch_a_touch_script("dashboard", "#npi-dashboard-scroll") + "</script>"
     components.html(
         floating_html,
         height=624,
@@ -4818,7 +4958,7 @@ body {{
     }});
     let panel=null,frame=null,api=null,drag=null,resizing=null,observer=null,raf=null,disposed=false;
     const removals=[];
-    function listen(target,type,fn,options){{target.addEventListener(type,fn,options);removals.push(()=>target.removeEventListener(type,fn,options));}}
+    function listen(target,type,fn,options){{if(!target || !target.addEventListener)return;target.addEventListener(type,fn,options);removals.push(()=>target.removeEventListener(type,fn,options));}}
     function schedule(){{if(disposed || raf)return;raf=parentWin.requestAnimationFrame(function(){{
         raf=null;
         try{{sync();}}catch(e){{
@@ -4863,7 +5003,7 @@ body {{
         const clipTop=Math.max(0,view.top-r.top),clipBottom=Math.max(0,r.bottom-view.bottom);
         const clipLeft=Math.max(0,view.left-r.left),clipRight=Math.max(0,r.right-view.right);
         const visible=clipTop+clipBottom<r.height && clipLeft+clipRight<r.width;
-        const desktop=api.getLayout().mode==='desktop';
+        const desktop=api.getLayout().mode==='desktop' && !!(parentWin.matchMedia && parentWin.matchMedia('(any-pointer: fine)').matches);
         Object.assign(panel.style,{{
             left:(left-base.left+offset.scrollLeft-offset.clientLeft)+'px',
             top:(top-base.top+offset.scrollTop-offset.clientTop)+'px',width:r.width+'px',height:r.height+'px',
@@ -4880,7 +5020,7 @@ body {{
         panel.querySelectorAll('[data-testid="stVerticalBlock"]').forEach(block=>block.style.gap='.3rem');
     }}
     listen(parentDoc,'pointerdown',function(event){{
-        if(!panel || !api || api.getLayout().mode!=='desktop' || event.button!==0 || !panel.contains(event.target))return;
+        if(!panel || !api || api.getLayout().mode!=='desktop' || event.pointerType!=='mouse' || event.button!==0 || !panel.contains(event.target))return;
         const r=panel.getBoundingClientRect();
         if(event.clientX>=r.right-18 && event.clientY>=r.bottom-18){{resizing=true;api.beginGesture();return;}}
         if(!event.target.closest('h3'))return;
@@ -4900,7 +5040,7 @@ body {{
         drag=null;resizing=null;api.endGesture();api.updatePanel('enquiry',patch,true);schedule();
     }}
     listen(parentDoc,'pointerup',finish,true);listen(parentDoc,'pointercancel',finish,true);
-    listen(parentWin,'resize',schedule);listen(parentWin,'scroll',schedule,{{capture:true,passive:true}});
+    listen(parentWin,'resize',schedule);listen(parentWin,'orientationchange',schedule);listen(parentWin.visualViewport,'resize',schedule);listen(parentWin,'scroll',schedule,{{capture:true,passive:true}});
     listen(parentDoc,'wheel',function(event){{
         if(!panel || !frame || !panel.contains(event.target))return;
         const target=event.target.closest('textarea');
@@ -4924,6 +5064,12 @@ body {{
     schedule();
 }})();
 
+        </script><script>
+        (function() {{
+            const script=window.parent.document.createElement('script');
+            script.textContent={json.dumps(_batch_a_touch_script("enquiry", 'div[class*="st-key-npi_enquiry_search_section"]'))};
+            window.parent.document.body.appendChild(script);script.remove();
+        }})();
         </script>""",
         height=1,
         scrolling=False,
@@ -5363,38 +5509,35 @@ def render_drilldown(df, title):
     st.markdown(
         """
         <style>
-        div[class*="st-key-drilldown_compact_header"] {
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] {
-            display: flex !important;
-            flex-wrap: nowrap !important;
-            align-items: center !important;
-            gap: 0.55rem !important;
-            width: 100% !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] > [data-testid="column"] {
-            min-width: 0 !important;
-            max-width: none !important;
-            padding: 0 !important;
-            margin: 0 !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] [data-testid="stButton"] button,
-        div[class*="st-key-drilldown_compact_header"] [data-testid="stPopover"] button {
-            min-height: 1.8rem !important;
-            height: 1.8rem !important;
-            padding: 0 0.4rem !important;
-            white-space: nowrap !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"] [data-testid="stHorizontalBlock"] {
-            gap: 0.2rem !important;
-            width: 100% !important;
-        }
-        div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"] [data-testid="column"] {
-            min-width: 0 !important;
-        }
-        </style>
+div[class*="st-key-drilldown_compact_header"] { width:100% !important; max-width:100% !important; min-width:0 !important; container-type:inline-size; container-name:npiDD; }
+div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) { display:grid !important; grid-template-columns:minmax(0,2.2fr) minmax(0,1.3fr) minmax(110px,1fr) minmax(230px,1.5fr) minmax(0,1.2fr) minmax(150px,1.2fr); align-items:center !important; gap:8px !important; width:100% !important; max-width:100% !important; }
+div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]) { min-width:0 !important; max-width:100% !important; width:auto !important; flex:none !important; padding:0 !important; margin:0 !important; }
+div[class*="st-key-drilldown_compact_header"] .npi-dd-title, div[class*="st-key-drilldown_compact_header"] .npi-dd-meta { margin:0; max-width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+div[class*="st-key-drilldown_compact_header"] :is([data-testid="stButton"],[data-testid="stPopover"],[data-testid="stDownloadButton"]) :is(button,a) { min-height:30px !important; height:auto !important; max-width:100%; padding:4px 6px !important; white-space:normal !important; overflow-wrap:anywhere; }
+div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4) [data-testid="stHorizontalBlock"] { display:grid !important; grid-template-columns:minmax(60px,1fr) 32px minmax(45px,.8fr) 32px minmax(35px,.6fr); gap:4px !important; width:100% !important; min-width:0; }
+div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4) [data-testid="stHorizontalBlock"] > :is([data-testid="column"],[data-testid="stColumn"]) { width:auto !important; min-width:0 !important; max-width:100% !important; flex:none !important; }
+div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4) [data-testid="stHorizontalBlock"] button { width:100%; }
+@container npiDD (max-width:1199px) {
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) { grid-template-columns:repeat(2,minmax(0,1fr)) !important; align-items:start !important; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(1) { grid-column:1; grid-row:1; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(2) { grid-column:2; grid-row:1; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(3) { grid-column:1; grid-row:2; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6) { grid-column:2; grid-row:2; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4) { grid-column:1; grid-row:3; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(5) { grid-column:2; grid-row:3; }
+ div[class*="st-key-drilldown_compact_header"] .npi-dd-title, div[class*="st-key-drilldown_compact_header"] .npi-dd-meta { white-space:normal !important; overflow:visible !important; overflow-wrap:anywhere; text-overflow:clip !important; }
+ div[class*="st-key-drilldown_compact_header"] :is([data-testid="stButton"],[data-testid="stPopover"],[data-testid="stDownloadButton"]) :is(button,a) { min-height:44px !important; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4) [data-testid="stHorizontalBlock"] { grid-template-columns:minmax(68px,1.1fr) 44px minmax(56px,1fr) 44px minmax(40px,.6fr) !important; }
+}
+@container npiDD (max-width:600px) {
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(1) { grid-column:1/-1; grid-row:1; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(2) { grid-column:1/-1; grid-row:2; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(3) { grid-column:1; grid-row:3; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6) { grid-column:2; grid-row:3; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4) { grid-column:1/-1; grid-row:4; }
+ div[class*="st-key-drilldown_compact_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(6)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(5) { grid-column:1/-1; grid-row:5; }
+}
+</style>
         """,
         unsafe_allow_html=True,
     )
@@ -5545,14 +5688,14 @@ def render_drilldown(df, title):
 
     # Fill the header placeholders after the current-process filter and
     # pagination totals have been calculated. The export remains on this row.
-    meta_style = "font-size:14px;color:#666;white-space:nowrap;line-height:1.3;"
+    meta_style = "font-size:14px;color:#666;line-height:1.3;"
     header_title_slot.markdown(
-        f"<div style='font-size:18px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
+        f"<div class='npi-dd-title' style='font-size:18px;font-weight:700;'>"
         f"{html_escape(title)}</div>",
         unsafe_allow_html=True,
     )
     header_customer_slot.markdown(
-        f"<div style='{meta_style}overflow:hidden;text-overflow:ellipsis;'>CUSTOMER: "
+        f"<div class='npi-dd-meta' style='{meta_style}overflow:hidden;text-overflow:ellipsis;'>CUSTOMER: "
         f"{html_escape(str(customer_display))}</div>",
         unsafe_allow_html=True,
     )
@@ -5576,7 +5719,7 @@ def render_drilldown(df, title):
             on_click=lambda k=page_state_key, p=page: st.session_state.__setitem__(k, max(1, p - 1)),
         )
         page_controls[2].markdown(
-            f"<div style='{meta_style}text-align:center;'>Page {page}</div>",
+            f"<div class='npi-dd-meta' style='{meta_style}text-align:center;'>Page {page}</div>",
             unsafe_allow_html=True,
         )
         page_controls[3].button(
@@ -5586,12 +5729,12 @@ def render_drilldown(df, title):
             on_click=lambda k=page_state_key, p=page, n=total_pages: st.session_state.__setitem__(k, min(n, p + 1)),
         )
         page_controls[4].markdown(
-            f"<div style='{meta_style}'>of {total_pages}</div>",
+            f"<div class='npi-dd-meta' style='{meta_style}'>of {total_pages}</div>",
             unsafe_allow_html=True,
         )
 
     header_records_slot.markdown(
-        f"<div style='{meta_style}overflow:hidden;text-overflow:ellipsis;'>Showing "
+        f"<div class='npi-dd-meta' style='{meta_style}overflow:hidden;text-overflow:ellipsis;'>Showing "
         f"{(page - 1) * page_size + 1:,}–"
         f"{min(page * page_size, total_rows):,} of {total_rows:,} records</div>",
         unsafe_allow_html=True,
@@ -6131,7 +6274,13 @@ def render_drilldown(df, title):
     html_parts.append(
         """
         <style>
+            html,body { margin:0; padding:0; width:100%; max-width:100%; overflow-x:hidden; }
+            .npi-drilldown-wrap[data-npi-freeze="off"] td.npi-frozen-col { position:static !important; left:auto !important; z-index:auto !important; }
+            .npi-drilldown-wrap[data-npi-freeze="off"] th.npi-frozen-col { left:auto !important; z-index:40 !important; }
             .npi-drilldown-wrap {
+                min-width:0;
+                max-width:100%;
+                box-sizing:border-box;
                 border: 1px solid #d8e0ea;
                 border-radius: 10px;
                 overflow: auto;
@@ -6181,7 +6330,7 @@ def render_drilldown(df, title):
 
     html_parts.append(
         f"""
-        <div class="npi-drilldown-wrap" style="
+        <div class="npi-drilldown-wrap" data-npi-freeze="off" data-npi-freeze-width="{cus_width + part_width + heading_widths['PICTURE']}" style="
             width:100%;
             max-height:calc(100vh - 220px);
             min-height:553px;
@@ -6290,7 +6439,7 @@ def render_drilldown(df, title):
 
         html_parts.append(
             f"""
-            <th
+            <th class="{'npi-frozen-col' if heading in sticky_left else ''}"
                 rowspan="2"
                 style="
                     width:{width}px;
@@ -6614,7 +6763,7 @@ def render_drilldown(df, title):
 
             html_parts.append(
                 f"""
-                <td
+                <td class="{'npi-frozen-col' if heading in sticky_left else ''}"
                     title="{html_escape(
                         safe_text(
                             cell_content
@@ -6737,6 +6886,7 @@ def render_drilldown(df, title):
         "</div>"
     )
 
+    html_parts.append("<script>" + _batch_a_touch_script("table", ".npi-drilldown-wrap") + "</script>")
     html_parts.append(
         """
         <script>
@@ -6993,7 +7143,9 @@ def render_drilldown(df, title):
     )
 
     component_event = _npi_drilldown_component(
-        html_content="".join(html_parts),
+        html_content=('<!doctype html><html><head><meta charset="utf-8">'
+                      '<meta name="viewport" content="width=device-width, initial-scale=1"></head><body>'
+                      + "".join(html_parts) + '</body></html>'),
         height=760,
         key="npi_drilldown_commitment_bridge",
         # Preserve scroll only while the displayed page and part order are unchanged.
@@ -7172,17 +7324,33 @@ def render_control_tower():
             [data-testid="stHorizontalBlock"] > [data-testid="column"] { min-width: min(100%, 260px) !important; flex: 1 1 100% !important; width: 100% !important; }
             [data-testid="stButton"] button, [data-testid="stDownloadButton"] button, [data-testid="stSelectbox"] div[data-baseweb="select"] { min-height: 42px !important; }
             [data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea, [data-testid="stDateInput"] input { font-size: 16px !important; }
-            div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
-            div[class*="st-key-drilldown_compact_header"] > div[data-testid="stHorizontalBlock"] > [data-testid="column"] { min-width: 0 !important; flex: 0 1 auto !important; width: auto !important; }
-            div[class*="st-key-drilldown_compact_header"] [data-testid="stButton"] button,
-            div[class*="st-key-drilldown_compact_header"] [data-testid="stPopover"] button { min-height: 38px !important; height: auto !important; white-space: normal !important; }
             [data-testid="stFileUploader"] section { padding: 0.65rem !important; }
         }
         @media (max-width: 420px) {
             .npi-control-tower-top-title { font-size: 20px !important; }
             [data-testid="stMainBlockContainer"] { padding-left: 0.45rem !important; padding-right: 0.45rem !important; }
         }
-        </style>
+        
+div[class*="st-key-npi_main_header"] { width:100%; max-width:100%; min-width:0; container-type:inline-size; container-name:npiMain; }
+div[class*="st-key-npi_main_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4)) { display:grid !important; grid-template-columns:minmax(0,1fr) max-content minmax(180px,240px) !important; gap:12px !important; align-items:center !important; width:100%; max-width:100%; }
+div[class*="st-key-npi_main_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4)) > :is([data-testid="column"],[data-testid="stColumn"]) { min-width:0 !important; width:auto !important; max-width:100% !important; flex:none !important; }
+div[class*="st-key-npi_main_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4) { display:none !important; }
+div[class*="st-key-npi_main_header"] .npi-main-title-date { display:flex; align-items:center; gap:12px; min-width:0; max-width:100%; }
+div[class*="st-key-npi_main_header"] .npi-control-tower-top-title, div[class*="st-key-npi_main_header"] .npi-control-tower-top-meta { margin:0; white-space:nowrap; }
+div[class*="st-key-npi_main_header"] [data-testid="stSelectbox"] { min-width:0; width:100%; max-width:100%; }
+@container npiMain (max-width:1199px) {
+ div[class*="st-key-npi_main_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4)) { grid-template-columns:max-content minmax(0,300px) !important; gap:10px !important; }
+ div[class*="st-key-npi_main_header"] [data-testid="stHorizontalBlock"]:has(> :is([data-testid="column"],[data-testid="stColumn"]):nth-child(4)) > :is([data-testid="column"],[data-testid="stColumn"]):nth-child(1) { grid-column:1/-1; }
+ div[class*="st-key-npi_main_header"] .npi-main-title-date { flex-wrap:wrap; gap:6px 12px; }
+ div[class*="st-key-npi_main_header"] .npi-control-tower-top-title { font-size:26px; white-space:normal !important; overflow-wrap:anywhere; }
+ div[class*="st-key-npi_main_header"] .npi-control-tower-top-meta { white-space:normal !important; overflow-wrap:anywhere; }
+}
+@container npiMain (max-width:600px) {
+ div[class*="st-key-npi_main_header"] .npi-main-title-date { flex-direction:column; align-items:flex-start; gap:6px; }
+ div[class*="st-key-npi_main_header"] .npi-control-tower-top-title { font-size:22px !important; line-height:1.25; }
+ div[class*="st-key-npi_main_header"] .npi-control-tower-top-meta { font-size:14px !important; line-height:1.35; }
+}
+</style>
         """,
         unsafe_allow_html=True,
     )
@@ -7222,41 +7390,39 @@ def render_control_tower():
     if current_customer not in customer_list:
         current_customer = "ALL"
 
-    # Keep the customer label immediately beside its selector.
-    # Keep the customer label/selector immediately after the title and date.
-    # The title column is deliberately narrower; its single-line content may
-    # overflow visually, while the next columns begin close to the text end.
-    header_title_col, header_customer_label_col, header_customer_col, _header_spacer_col = st.columns(
-        [3.8, 0.72, 1.45, 4.03],
-        vertical_alignment="center",
-        gap="small",
-    )
-
-    with header_title_col:
-        st.markdown(
-            f"""
-            <div style="display:flex; align-items:center; gap:12px; white-space:nowrap; overflow:visible;">
-                <span class="npi-control-tower-top-title">NPI CONTROL TOWER</span>
-                <span class="npi-control-tower-top-meta">| Control Date: {control_date.strftime('%d/%m/%Y')} |</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    # Scoped responsive native header; keep the existing Customer widget and key.
+    with st.container(key="npi_main_header"):
+        header_title_col, header_customer_label_col, header_customer_col, _header_spacer_col = st.columns(
+            [3.8, 0.72, 1.45, 4.03],
+            vertical_alignment="center",
+            gap="small",
         )
 
-    with header_customer_label_col:
-        st.markdown(
-            '<div class="npi-control-tower-top-meta" style="white-space:nowrap;">Customer:</div>',
-            unsafe_allow_html=True,
-        )
+        with header_title_col:
+            st.markdown(
+                f"""
+                <div class="npi-main-title-date">
+                    <span class="npi-control-tower-top-title">NPI CONTROL TOWER</span>
+                    <span class="npi-control-tower-top-meta">| Control Date: {control_date.strftime('%d/%m/%Y')} |</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-    with header_customer_col:
-        selected_customer_ui = st.selectbox(
-            "Customer",
-            customer_list,
-            index=customer_list.index(current_customer),
-            key="control_tower_customer",
-            label_visibility="collapsed",
-        )
+        with header_customer_label_col:
+            st.markdown(
+                '<div class="npi-control-tower-top-meta" style="white-space:nowrap;">Customer:</div>',
+                unsafe_allow_html=True,
+            )
+
+        with header_customer_col:
+            selected_customer_ui = st.selectbox(
+                "Customer",
+                customer_list,
+                index=customer_list.index(current_customer),
+                key="control_tower_customer",
+                label_visibility="collapsed",
+            )
 
     if (
         selected_customer_ui

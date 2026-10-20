@@ -4894,7 +4894,11 @@ body {{
     # rerun, allowing the Drilldown to update using the same unique-part dataset.
     with st.container(key="npi_enquiry_search_section", border=True):
         st.markdown("### ENQUIRY FINDER")
-        st.caption("One full part number per line.")
+        st.markdown(
+            '<p class="npi-enquiry-instruction" style="color:#475569;font-size:13px;line-height:1.4;'
+            'margin:0 0 6px;white-space:normal;overflow-wrap:anywhere;">One full part number per line.</p>',
+            unsafe_allow_html=True,
+        )
         with st.form("npi_enquiry_search_form", clear_on_submit=False):
             st.text_area(
                 "Full part number(s)",
@@ -5484,27 +5488,99 @@ def render_drilldown(df, title):
     st.markdown(
         """
         <style>
-div.st-key-drilldown_compact_header { container-type:inline-size; container-name:npiDD; min-width:0; max-width:100%; }
-div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) { display:grid !important; grid-template-columns:minmax(0,1.4fr) minmax(130px,.7fr) minmax(270px,1.3fr) minmax(150px,.7fr); gap:12px !important; align-items:center; }
-div.st-key-drilldown_compact_header :is([data-testid="column"],[data-testid="stColumn"]) { min-width:0 !important; width:auto !important; max-width:100% !important; flex:none !important; }
-div.st-key-drilldown_compact_header [data-testid="stVerticalBlock"] { gap:4px; }
-div.st-key-drilldown_compact_header .npi-dd-title { font-size:18px; font-weight:700; color:#20354f; line-height:1.3; margin:0; overflow-wrap:anywhere; }
-div.st-key-drilldown_compact_header .npi-dd-meta { font-size:12px; color:#64748b; line-height:1.4; margin:0; white-space:normal; overflow-wrap:anywhere; }
-div.st-key-drilldown_compact_header :is(button,a) { min-height:36px; height:auto; white-space:normal !important; overflow-wrap:anywhere; max-width:100%; }
-div.st-key-npi_dd_navigation [data-testid="stHorizontalBlock"] { display:grid !important; grid-template-columns:minmax(54px,1fr) 40px minmax(54px,1fr) 40px minmax(34px,.6fr); gap:4px !important; }
-div.st-key-npi_dd_navigation button { width:100%; padding:4px !important; }
+
+
+div.st-key-npi_main_header, div.st-key-drilldown_compact_header {
+ --npi-fg:#102033; --npi-muted:#58677a; --npi-border:#ccd7e3; --npi-control:#edf2f7;
+ --npi-panel-a:#f2f6fa; --npi-panel-b:#fff;
+ color:var(--npi-fg); font-family:Arial,Helvetica,sans-serif;
+ background:linear-gradient(115deg,var(--npi-panel-a),var(--npi-panel-b)); box-sizing:border-box;
+}
+:root[data-npi-header-theme="dark"] div.st-key-npi_main_header,
+:root[data-npi-header-theme="dark"] div.st-key-drilldown_compact_header {
+ --npi-fg:#f4f7fb; --npi-muted:#afbed0; --npi-border:#435467; --npi-control:#26313e;
+ --npi-panel-a:#1b2530; --npi-panel-b:#121920;
+}
+div.st-key-npi_main_header *, div.st-key-drilldown_compact_header * { box-sizing:border-box; }
+div.st-key-npi_main_header [data-testid="stMarkdownContainer"], div.st-key-drilldown_compact_header [data-testid="stMarkdownContainer"] { margin:0 !important; font-family:Arial,Helvetica,sans-serif; }
+div.st-key-npi_main_header [data-testid="stMarkdownContainer"] p, div.st-key-drilldown_compact_header [data-testid="stMarkdownContainer"] p { margin:0; }
+:root[data-npi-header-theme="dark"] div.st-key-drilldown_compact_header { --npi-panel-a:#151c24; --npi-panel-b:#0e141a; }
+div.st-key-drilldown_compact_header { container-type:inline-size; container-name:npiDD; min-width:0; max-width:100%; border:1px solid var(--npi-border); border-radius:4px 4px 0 0; }
+div.st-key-npi_dd_layout { padding:20px 24px; display:grid !important; grid-template-columns:minmax(180px,248px) minmax(250px,290px) minmax(0,1fr) 398px; grid-template-areas:"summary summary summary records" "filter export . navigation"; gap:18px 12px !important; align-items:end; }
+div.st-key-npi_dd_layout > [data-testid="stLayoutWrapper"] { display:contents; }
+div.st-key-npi_dd_summary { grid-area:summary; }
+div.st-key-npi_dd_filter { grid-area:filter; }
+div.st-key-npi_dd_export { grid-area:export; }
+div.st-key-npi_dd_navigation { grid-area:navigation; width:max-content; max-width:100%; --npi-next-bg:linear-gradient(110deg,#0795aa,#047c90); --npi-next-fg:#fff; }
+:root[data-npi-header-theme="dark"] div.st-key-npi_dd_navigation { --npi-next-bg:var(--npi-control); --npi-next-fg:#1bb9cf; }
+div.st-key-npi_dd_records { grid-area:records; align-self:center; }
+div.st-key-npi_dd_records .npi-dd-meta { text-align:right; }
+div.st-key-drilldown_compact_header :is([data-testid="stVerticalBlock"],[data-testid="stElementContainer"],[data-testid="stLayoutWrapper"],[data-testid="stColumn"],[data-testid="column"]) { min-width:0 !important; max-width:100%; }
+div.st-key-drilldown_compact_header [data-testid="stVerticalBlock"]:not(.st-key-npi_dd_layout) { gap:0 !important; }
+div.st-key-drilldown_compact_header [data-testid="stElementContainer"] { flex:0 0 auto !important; }
+div.st-key-drilldown_compact_header .npi-dd-summary { display:flex; flex-wrap:wrap; gap:6px 20px; align-items:baseline; }
+div.st-key-drilldown_compact_header .npi-dd-title { font:700 18px/1.25 Arial,Helvetica,sans-serif; margin:0; overflow-wrap:anywhere; }
+div.st-key-drilldown_compact_header .npi-dd-meta { font:400 14px/1.35 Arial,Helvetica,sans-serif; color:var(--npi-muted); margin:0; overflow-wrap:anywhere; }
+div.st-key-drilldown_compact_header .npi-dd-label { font:400 13px/18px Arial,Helvetica,sans-serif; color:var(--npi-muted); margin:0 0 4px; }
+div.st-key-drilldown_compact_header :is([data-testid="stButton"],[data-testid="stDownloadButton"],[data-testid="stPopover"]) button {
+ width:100% !important; min-height:48px !important; height:48px; padding:8px 12px !important;
+ background:linear-gradient(120deg,var(--npi-control),var(--npi-panel-a)); color:var(--npi-fg);
+ border:1px solid var(--npi-border); border-radius:5px; font-family:Arial,Helvetica,sans-serif; line-height:1.2; }
+div.st-key-drilldown_compact_header button p { font:500 16px/1.2 Arial,Helvetica,sans-serif !important; }
+div.st-key-drilldown_compact_header button:disabled { opacity:.42; }
+div.st-key-npi_dd_filter { position:relative; }
+div.st-key-npi_dd_filter > [data-testid="stElementContainer"]:has(.npi-dd-label) { position:absolute; left:16px; top:4px; z-index:1; pointer-events:none; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button { height:56px; padding-top:22px !important; text-align:left; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button p { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button > div { min-width:0; width:100%; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button p { text-align:left; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button span[data-has-shortcut] { display:block; width:100%; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button > div { display:flex; justify-content:space-between; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button > div > div:first-child { flex:1; text-align:left; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button [data-testid="stMarkdownContainer"] { width:100%; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_export button { height:56px; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_export [data-testid="stDownloadButton"] button::before { content:""; width:24px; height:24px; flex:0 0 24px; margin-right:8px; background:currentColor; mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cg fill='none' stroke='black' stroke-width='1.8'%3E%3Cpath d='M12 2v13m-5-5 5 5 5-5M3 15v6h18v-6'/%3E%3C/g%3E%3C/svg%3E") center/contain no-repeat; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_export button p { white-space:normal; }
+div.st-key-npi_dd_navigation [data-testid="stHorizontalBlock"] { display:grid !important; grid-template-columns:96px 56px 152px 64px; gap:10px !important; align-items:center; }
+div.st-key-npi_dd_navigation :is([data-testid="stColumn"],[data-testid="column"]) { width:100% !important; flex:none !important; min-width:0 !important; }
+/* Native fit-content wrappers must fill their assigned grid cell, not just the grid itself. */
+div.st-key-npi_dd_navigation :is([data-testid="stElementContainer"],[data-testid="stButton"]) { width:100% !important; min-width:100% !important; }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_navigation button { min-width:100% !important; }
+div.st-key-npi_dd_navigation .npi-dd-page { font:500 16px/46px Arial,Helvetica,sans-serif; height:48px; text-align:center; white-space:nowrap; border:1px solid var(--npi-border); border-radius:5px; background:var(--npi-control); }
+div.st-key-drilldown_compact_header div.st-key-npi_dd_navigation [data-testid="stColumn"]:last-child button:not(:disabled) { background:var(--npi-next-bg); color:var(--npi-next-fg); border-color:var(--npi-border); }
 @container npiDD (max-width:1199px) {
- div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
- div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) > :is([data-testid="column"],[data-testid="stColumn"]):has(.st-key-npi_dd_navigation) { grid-column:1; grid-row:2; }
- div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) > :is([data-testid="column"],[data-testid="stColumn"]):has(.st-key-npi_dd_export) { grid-column:2; grid-row:2; }
- div.st-key-drilldown_compact_header :is(button,a) { min-height:42px; }
+ div.st-key-npi_dd_navigation, :root[data-npi-header-theme="dark"] div.st-key-npi_dd_navigation { --npi-next-bg:var(--npi-control); --npi-next-fg:var(--npi-fg); }
+ div.st-key-npi_dd_layout::after { content:""; grid-column:1/-1; grid-row:3; align-self:stretch; border-top:1px solid var(--npi-border); margin:-6px -16px -12px; pointer-events:none; }
+ div.st-key-npi_dd_layout { padding:12px 16px; grid-template-columns:minmax(352px,1.15fr) minmax(0,.95fr); grid-template-areas:"summary summary" "filter export" "navigation records"; gap:12px 12px !important; }
+ div.st-key-drilldown_compact_header .npi-dd-summary { display:block; }
+ div.st-key-drilldown_compact_header .npi-dd-summary .npi-dd-meta { margin-top:5px; font-size:14px; }
+ div.st-key-npi_dd_filter > [data-testid="stElementContainer"]:has(.npi-dd-label) { position:static; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button { height:44px; min-height:44px !important; padding-top:8px !important; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_export button { height:44px; min-height:44px !important; color:#fff; background:linear-gradient(110deg,#14b7c9,#0594aa); border-color:#0ba8ba; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_export button p { font-size:14px !important; }
+ div.st-key-npi_dd_navigation [data-testid="stHorizontalBlock"] { grid-template-columns:80px 56px 136px 56px; gap:8px !important; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_navigation button { height:44px; min-height:44px !important; }
+ div.st-key-npi_dd_navigation .npi-dd-page { height:44px; line-height:42px; }
 }
 @container npiDD (max-width:650px) {
- div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) { gap:8px !important; }
- div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) > :is([data-testid="column"],[data-testid="stColumn"]):has(.st-key-npi_dd_summary) { grid-column:1/-1; grid-row:1; }
- div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) > :is([data-testid="column"],[data-testid="stColumn"]):has(.st-key-npi_dd_filter) { grid-column:1; grid-row:2; }
- div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) > :is([data-testid="column"],[data-testid="stColumn"]):has(.st-key-npi_dd_export) { grid-column:2; grid-row:2; }
- div.st-key-drilldown_compact_header [data-testid="stHorizontalBlock"]:has(.st-key-npi_dd_summary) > :is([data-testid="column"],[data-testid="stColumn"]):has(.st-key-npi_dd_navigation) { grid-column:1/-1; grid-row:3; }
+ div.st-key-npi_dd_navigation, :root[data-npi-header-theme="dark"] div.st-key-npi_dd_navigation { --npi-next-bg:linear-gradient(110deg,#0aacc0,#00869b); --npi-next-fg:#fff; }
+ div.st-key-npi_dd_layout::after { display:none; }
+ div.st-key-npi_dd_layout { padding:20px 16px 16px; grid-template-columns:minmax(0,1.12fr) minmax(0,1fr); grid-template-areas:"summary summary" "filter export" "navigation navigation" "records records"; gap:20px 8px !important; }
+ div.st-key-drilldown_compact_header .npi-dd-title { font-size:21px; }
+ div.st-key-drilldown_compact_header .npi-dd-meta { font-size:14px; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_export button { height:52px; min-height:52px !important; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_export button p { font-size:13px !important; font-weight:600 !important; overflow-wrap:normal !important; word-break:normal !important; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_export button { padding:6px 8px !important; gap:0 !important; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_export [data-testid="stDownloadButton"] button::before { width:20px; height:20px; flex-basis:20px; margin-right:4px; }
+ div.st-key-drilldown_compact_header div.st-key-npi_dd_filter [data-testid="stPopover"] button { height:52px; min-height:52px !important; }
+ div.st-key-npi_dd_navigation { width:100%; }
+ div.st-key-npi_dd_navigation [data-testid="stHorizontalBlock"] { grid-template-columns:64px 48px minmax(96px,144px) 52px; gap:8px !important; justify-content:space-between; }
+ div.st-key-npi_dd_navigation .npi-dd-page { background:transparent; border-color:transparent; }
+ div.st-key-npi_dd_records .npi-dd-meta { text-align:center; }
+}
+@container npiDD (max-width:360px) {
+ div.st-key-npi_dd_navigation [data-testid="stHorizontalBlock"] { grid-template-columns:56px 44px minmax(72px,1fr) 44px; gap:6px !important; }
+ div.st-key-drilldown_compact_header .npi-dd-title { font-size:20px; }
 }
 </style>
         """,
@@ -5540,21 +5616,22 @@ div.st-key-npi_dd_navigation button { width:100%; padding:4px !important; }
     selected_current_process = st.session_state.get(current_process_filter_key, "ALL")
 
     with st.container(key="drilldown_compact_header"):
-        header_cols = st.columns([3, 1.5, 3, 1.5], vertical_alignment="center", gap="small")
-        with header_cols[0], st.container(key="npi_dd_summary"):
-            header_title_slot = st.empty()
-            header_customer_slot = st.empty()
-        with header_cols[1], st.container(key="npi_dd_filter"):
-            header_process_slot = st.empty()
-        with header_cols[2], st.container(key="npi_dd_navigation"):
-            header_page_slot = st.empty()
-            header_records_slot = st.empty()
-        with header_cols[3], st.container(key="npi_dd_export"):
-            header_export_slot = st.empty()
+        with st.container(key="npi_dd_layout"):
+            with st.container(key="npi_dd_summary"):
+                header_title_slot = st.empty()
+            with st.container(key="npi_dd_filter"):
+                st.markdown('<p class="npi-dd-label">Current Process</p>', unsafe_allow_html=True)
+                header_process_slot = st.empty()
+            with st.container(key="npi_dd_export"):
+                header_export_slot = st.empty()
+            with st.container(key="npi_dd_navigation"):
+                header_page_slot = st.empty()
+            with st.container(key="npi_dd_records"):
+                header_records_slot = st.empty()
 
         with header_process_slot.container():
             with st.popover(
-                "Current Process",
+                selected_current_process,
                 key="drilldown_current_process_popover",
                 use_container_width=True,
             ):
@@ -5657,53 +5734,43 @@ div.st-key-npi_dd_navigation button { width:100%; padding:4px !important; }
 
     # Fill the header placeholders after the current-process filter and
     # pagination totals have been calculated. Export uses its responsive group.
-    meta_style = "font-size:12px;color:#64748b;line-height:1.4;"
     header_title_slot.markdown(
-        f"<div class='npi-dd-title' style='font-size:18px;font-weight:700;'>"
-        f"{html_escape(title)}</div>",
-        unsafe_allow_html=True,
-    )
-    header_customer_slot.markdown(
-        f"<div class='npi-dd-meta' style='{meta_style}'>CUSTOMER: "
-        f"{html_escape(str(customer_display))}</div>",
+        f"<div class='npi-dd-summary'><div class='npi-dd-title'>{html_escape(title)}</div>"
+        f"<div class='npi-dd-meta'>Customer: {html_escape(str(customer_display))}</div></div>",
         unsafe_allow_html=True,
     )
 
     with header_page_slot.container():
         page_controls = st.columns(
-            [1.2, 0.45, 0.85, 0.45, 0.65],
+            [0.7, 0.55, 1.5, 0.55],
             vertical_alignment="center",
             gap="small",
         )
         page_controls[0].button(
-            "First …",
+            "First",
             key=f"drilldown_first_page_{title}",
             disabled=(page <= 1),
             on_click=lambda k=page_state_key: st.session_state.__setitem__(k, 1),
         )
         page_controls[1].button(
-            "−",
+            "‹",
             key=f"drilldown_prev_page_{title}",
             disabled=(page <= 1),
             on_click=lambda k=page_state_key, p=page: st.session_state.__setitem__(k, max(1, p - 1)),
         )
         page_controls[2].markdown(
-            f"<div class='npi-dd-meta' style='{meta_style}text-align:center;'>Page {page}</div>",
+            f"<div class='npi-dd-page'>Page {page} of {total_pages}</div>",
             unsafe_allow_html=True,
         )
         page_controls[3].button(
-            "+",
+            "›",
             key=f"drilldown_next_page_{title}",
             disabled=(page >= total_pages),
             on_click=lambda k=page_state_key, p=page, n=total_pages: st.session_state.__setitem__(k, min(n, p + 1)),
         )
-        page_controls[4].markdown(
-            f"<div class='npi-dd-meta' style='{meta_style}'>of {total_pages}</div>",
-            unsafe_allow_html=True,
-        )
 
     header_records_slot.markdown(
-        f"<div class='npi-dd-meta' style='{meta_style}'>Showing "
+        f"<div class='npi-dd-meta'>Showing "
         f"{(page - 1) * page_size + 1:,}–"
         f"{min(page * page_size, total_rows):,} of {total_rows:,} records</div>",
         unsafe_allow_html=True,
@@ -6203,7 +6270,7 @@ div.st-key-npi_dd_navigation button { width:100%; padding:4px !important; }
         excel_buffer = BytesIO()
         workbook.save(excel_buffer)
         header_export_slot.download_button(
-            "Download Drilldown Excel",
+            "Download Drilldown\u00a0Excel",
             data=excel_buffer.getvalue(),
             file_name="NPI_Control_Tower_Drilldown.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -7291,21 +7358,78 @@ def render_control_tower():
             [data-testid="stMainBlockContainer"] { padding-left: 0.45rem !important; padding-right: 0.45rem !important; }
         }
         
-div.st-key-npi_main_header { container-type:inline-size; container-name:npiMain; min-width:0; max-width:100%; }
-div.st-key-npi_main_header [data-testid="stHorizontalBlock"] { display:grid !important; grid-template-columns:minmax(0,1fr) minmax(180px,260px); gap:16px !important; align-items:center; }
-div.st-key-npi_main_header :is([data-testid="column"],[data-testid="stColumn"]) { min-width:0 !important; width:auto !important; max-width:100% !important; flex:none !important; }
-div.st-key-npi_main_header [data-testid="stVerticalBlock"] { gap:4px; }
-div.st-key-npi_main_header .npi-control-tower-top-title { display:block; font-size:28px; line-height:1.2; color:#20354f; letter-spacing:-.5px; white-space:normal; overflow-wrap:anywhere; }
-div.st-key-npi_main_header .npi-control-tower-top-meta { display:block; font-size:13px; color:#64748b; line-height:1.4; white-space:normal; margin-top:5px; }
-div.st-key-npi_main_header .npi-header-label { font-size:12px; font-weight:600; color:#64748b; margin:0; }
-div.st-key-npi_main_header [data-testid="stSelectbox"] { min-width:0; max-width:100%; }
-@container npiMain (max-width:650px) {
- div.st-key-npi_main_header [data-testid="stHorizontalBlock"] { grid-template-columns:minmax(0,1fr); gap:10px !important; }
- div.st-key-npi_main_header .npi-control-tower-top-title { font-size:24px !important; }
+
+
+div.st-key-npi_main_header, div.st-key-drilldown_compact_header {
+ --npi-fg:#102033; --npi-muted:#58677a; --npi-border:#ccd7e3; --npi-control:#edf2f7;
+ --npi-panel-a:#f2f6fa; --npi-panel-b:#fff;
+ color:var(--npi-fg); font-family:Arial,Helvetica,sans-serif;
+ background:linear-gradient(115deg,var(--npi-panel-a),var(--npi-panel-b)); box-sizing:border-box;
 }
+:root[data-npi-header-theme="dark"] div.st-key-npi_main_header,
+:root[data-npi-header-theme="dark"] div.st-key-drilldown_compact_header {
+ --npi-fg:#f4f7fb; --npi-muted:#afbed0; --npi-border:#435467; --npi-control:#26313e;
+ --npi-panel-a:#1b2530; --npi-panel-b:#121920;
+}
+div.st-key-npi_main_header *, div.st-key-drilldown_compact_header * { box-sizing:border-box; }
+div.st-key-npi_main_header [data-testid="stMarkdownContainer"], div.st-key-drilldown_compact_header [data-testid="stMarkdownContainer"] { margin:0 !important; font-family:Arial,Helvetica,sans-serif; }
+div.st-key-npi_main_header [data-testid="stMarkdownContainer"] p, div.st-key-drilldown_compact_header [data-testid="stMarkdownContainer"] p { margin:0; }
+div.st-key-npi_main_header { container-type:inline-size; container-name:npiMain; padding:24px 40px; min-width:0; max-width:100%; }
+div.st-key-npi_main_header [data-testid="stHorizontalBlock"] { display:grid !important; grid-template-columns:minmax(0,1fr) minmax(220px,300px); gap:24px !important; align-items:center; }
+div.st-key-npi_main_header :is([data-testid="column"],[data-testid="stColumn"]) { min-width:0 !important; width:auto !important; max-width:100% !important; flex:none !important; }
+div.st-key-npi_main_header [data-testid="stVerticalBlock"] { gap:6px !important; }
+div.st-key-npi_main_header .npi-control-tower-top-title { display:block; font:800 30px/1.2 Arial,Helvetica,sans-serif !important; color:var(--npi-fg); letter-spacing:-.6px; white-space:normal; overflow-wrap:anywhere; margin:0; }
+div.st-key-npi_main_header .npi-control-tower-top-meta { display:flex; flex-wrap:wrap; gap:8px 20px; align-items:baseline; font:400 15px/1.4 Arial,Helvetica,sans-serif !important; color:var(--npi-fg); white-space:normal; margin:10px 0 0; }
+div.st-key-npi_main_header .npi-control-tower-top-meta span { color:var(--npi-muted); font-size:14px; }
+div.st-key-npi_main_header .npi-header-label { font:500 13px/18px Arial,Helvetica,sans-serif; color:var(--npi-muted); margin:0; }
+div.st-key-npi_main_header [data-testid="stSelectbox"] { min-width:0; max-width:100%; margin:0; }
+div.st-key-npi_main_header [data-baseweb="select"] > div { min-height:52px; background:linear-gradient(120deg,var(--npi-control),var(--npi-panel-a)); border:1px solid var(--npi-border); border-radius:5px; }
+div.st-key-npi_main_header [data-baseweb="select"] * { font-family:Arial,Helvetica,sans-serif; font-size:17px; }
+div.st-key-npi_main_header [data-testid="stElementContainer"] { flex:0 0 auto !important; }
+@media (max-width:760px) { div.st-key-npi_main_header { margin-top:44px; } }
+@container npiMain (max-width:1000px) {
+ div.st-key-npi_main_header [data-testid="stHorizontalBlock"] { grid-template-columns:minmax(0,1fr) 220px; gap:20px !important; }
+ div.st-key-npi_main_header .npi-control-tower-top-title { font-size:24px !important; }
+ div.st-key-npi_main_header .npi-control-tower-top-meta { font-size:12px !important; gap:6px 10px; }
+ div.st-key-npi_main_header .npi-control-tower-top-meta span { font-size:11px; }
+ div.st-key-npi_main_header [data-baseweb="select"] > div { min-height:44px; }
+}
+@container npiMain (max-width:650px) {
+ div.st-key-npi_main_header [data-testid="stHorizontalBlock"] { grid-template-columns:minmax(0,1fr); gap:20px !important; }
+ div.st-key-npi_main_header .npi-control-tower-top-title { font-size:23px !important; letter-spacing:-.5px; }
+ div.st-key-npi_main_header .npi-control-tower-top-meta { margin-top:8px; gap:8px 14px; font-size:15px !important; }
+ div.st-key-npi_main_header .npi-control-tower-top-meta span { font-size:14px; }
+}
+@media (max-width:1100px) { div.st-key-npi_main_header { padding:12px 16px; } }
+@media (max-width:650px) { div.st-key-npi_main_header { padding:24px 16px 18px; } }
 </style>
         """,
         unsafe_allow_html=True,
+    )
+
+    # Header palette only: observe Streamlit theme class, never touch viewport or widget state.
+    components.html(
+        """<script>
+        (function(){
+          const d=parent.document, app=d.querySelector('[data-testid="stApp"]');
+          if(!app)return;
+          if(parent.__npiHeaderPaletteObserver)parent.__npiHeaderPaletteObserver.disconnect();
+          const apply=()=>{
+            const rgb=parent.getComputedStyle(app).backgroundColor.match(/[0-9.]+/g);
+            if(!rgb||rgb.length<3)return;
+            const dark=(.2126*Number(rgb[0])+.7152*Number(rgb[1])+.0722*Number(rgb[2]))<128;
+            const theme=dark?'dark':'light';
+            if(d.documentElement.dataset.npiHeaderTheme!==theme)d.documentElement.dataset.npiHeaderTheme=theme;
+          };
+          apply();
+          const observer=new parent.MutationObserver(apply);
+          observer.observe(app,{attributes:true,attributeFilter:['class','style']});
+          parent.__npiHeaderPaletteObserver=observer;
+          let wrapper=window.frameElement;
+          while(wrapper&&wrapper.getAttribute('data-testid')!=='stElementContainer')wrapper=wrapper.parentElement;
+          if(wrapper)wrapper.style.display='none';
+        })();
+        </script>""", height=0,
     )
 
     # --------------------------------------------------------
@@ -7356,7 +7480,7 @@ div.st-key-npi_main_header [data-testid="stSelectbox"] { min-width:0; max-width:
                 f"""
                 <div class="npi-main-title-date">
                     <span class="npi-control-tower-top-title">NPI CONTROL TOWER</span>
-                    <span class="npi-control-tower-top-meta">Control Date · {control_date.strftime('%d/%m/%Y')}</span>
+                    <span class="npi-control-tower-top-meta"><span>Control Date</span><strong style="font-weight:500">{control_date.strftime('%d/%m/%Y')}</strong></span>
                 </div>
                 """,
                 unsafe_allow_html=True,

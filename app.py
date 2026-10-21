@@ -7081,11 +7081,6 @@ div.st-key-drilldown_compact_header div.st-key-npi_dd_navigation [data-testid="s
                     const popupFeatures = desktopPopup
                         ? 'width=' + Math.min(1440, window.screen.availWidth) + ',height=' + Math.min(900, window.screen.availHeight) + ',resizable=yes,scrollbars=yes'
                         : undefined;
-                    const popup = desktopPopup ? window.open('', '_blank', popupFeatures) : window.open('', '_blank');
-                    if (!popup) {
-                        alert('Part Detail pop-up was blocked by your browser. Please allow pop-ups for this app and click the row again.');
-                        return;
-                    }
                     const esc = (value) => String(value == null || value === '' ? '—' : value)
                         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
                         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -7108,8 +7103,69 @@ div.st-key-drilldown_compact_header div.st-key-npi_dd_navigation [data-testid="s
                         return `<tr><td class="step">${i + 1}</td><td>${esc(r['Operation'])}</td><td>${esc(r['Plan Start Date'])}</td><td class="${late ? 'actual-late' : ''}">${esc(r['Actual Start Date'])}</td></tr>`;
                     }).join('') : '<tr><td colspan="4" class="empty">No process routing records available in the loaded data.</td></tr>';
                     const picture = detail.Picture ? `<img class="part-picture" src="${detail.Picture}" alt="Part picture">` : '<div class="picture-placeholder">No picture available</div>';
-                    popup.document.open();
-                    popup.document.write(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Part Detail — ${esc(detail['Part Number'])}</title><style>
+                    // Open a complete navigable document; keep the accepted markup and Save runtime.
+                    function npiViewportProbe() {
+                        if (window.npiPartDetailDiagnostics) return;
+                        const samples = [];
+                        function sample(stage) {
+                            if (samples.length >= 128) return;
+                            const root = document.querySelector('.page'), rect = root && root.getBoundingClientRect();
+                            const css = root && getComputedStyle(root), vv = window.visualViewport;
+                            samples.push({stage, elapsedMs: Math.round(performance.now()*10)/10,
+                                readyState: document.readyState, visibility: document.visibilityState,
+                                scheme: location.protocol, innerWidth, innerHeight,
+                                clientWidth: document.documentElement.clientWidth, clientHeight: document.documentElement.clientHeight,
+                                visualViewport: vv ? {width:vv.width,height:vv.height,scale:vv.scale} : null,
+                                dpr: devicePixelRatio, screen:{width:screen.width,height:screen.height},
+                                root:rect ? {x:rect.x,y:rect.y,width:rect.width,height:rect.height} : null,
+                                rootStyle:css ? {width:css.width,maxWidth:css.maxWidth,minWidth:css.minWidth,transform:css.transform} : null,
+                                media:{phone:matchMedia('(max-width:599px)').matches,singleColumn:matchMedia('(max-width:959px)').matches,
+                                    short:matchMedia('(max-height:520px)').matches,coarse:matchMedia('(any-pointer:coarse)').matches}});
+                        }
+                        function exportLog() {
+                            sample('export');
+                            const url = URL.createObjectURL(new Blob([JSON.stringify({schema:1,samples},null,2)],{type:'application/json'}));
+                            const link = document.createElement('a'); link.href=url; link.download='npi-part-detail-viewport.json';
+                            link.click(); URL.revokeObjectURL(url);
+                        }
+                        window.npiPartDetailDiagnostics={samples,exportLog};
+                        sample('document-execution');
+                        document.addEventListener('DOMContentLoaded',function(){
+                            sample('DOMContentLoaded');
+                            const button=document.createElement('button'); button.id='npi-viewport-log'; button.textContent='Viewport log';
+                            button.style.cssText='position:fixed;bottom:8px;right:8px;z-index:9999;padding:6px 10px;font:12px Arial;background:#fff;color:#142033;border:1px solid #91a2b7;border-radius:5px';
+                            button.addEventListener('click',exportLog); document.body.appendChild(button);
+                        },{once:true});
+                        window.addEventListener('load',()=>sample('load'),{once:true});
+                        requestAnimationFrame(function(){sample('rAF-1');requestAnimationFrame(()=>sample('rAF-2'));});
+                        window.addEventListener('resize',()=>sample('window.resize'));
+                        window.addEventListener('orientationchange',()=>sample('orientationchange'));
+                        if(window.visualViewport) window.visualViewport.addEventListener('resize',()=>sample('visualViewport.resize'));
+                        document.addEventListener('visibilitychange',function(){sample('visibilitychange');
+                            if(document.visibilityState==='visible') requestAnimationFrame(()=>sample('visible-rAF'));});
+                        window.addEventListener('pageshow',()=>sample('pageshow'));
+                    }
+                    const diagnosticsEnabled=(()=>{
+                        let context=window;
+                        for(let depth=0;depth<4;depth++){
+                            try{
+                                if(new URL(context.location.href).searchParams.get('npi_part_detail_debug')==='1') return true;
+                                if(context===context.parent) break;
+                                context=context.parent;
+                            }catch(e){break;}
+                        }
+                        return false;
+                    })();
+                    const diagnosticScript=diagnosticsEnabled ? '<scr'+'ipt>('+npiViewportProbe.toString()+')();</scr'+'ipt>' : '';
+                    const popupConfig={bridge_id:popupBridgeId,popup_id:makeRequestId(),
+                        part_key:String(detail['Commitment Part Key']||detail['Part Number']||'').trim()};
+                    const configJSON=JSON.stringify(popupConfig).replace(/</g,String.fromCharCode(92)+'u003c');
+                    // Cache the same stable component proxy as before; retain the existing channel fallback.
+                    const bootstrap="try { window.npiCommitmentBridge=window.opener && window.opener.parent; } catch(e) {}"
+                        +"window.addEventListener('pagehide',function(){URL.revokeObjectURL(location.href);},{once:true});"
+                        +'('+npiPopupMain.toString()+')('+configJSON+');';
+                    const runtimeScript='<scr'+'ipt>'+bootstrap+'</scr'+'ipt>';
+                    const popupHTML=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">${diagnosticScript}<title>Part Detail — ${esc(detail['Part Number'])}</title><style>
                         *{box-sizing:border-box}html{min-height:100%;overflow-x:hidden}body{margin:0;padding:12px;background:#eef3f8;color:#142033;font-family:Arial,"Nimbus Sans","Segoe UI",sans-serif;font-size:14px;line-height:1.4;overflow-wrap:anywhere}
                         .page{width:100%;min-width:0;min-height:calc(100vh - 24px);min-height:calc(100dvh - 24px);margin:0 auto}
                         .top{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:14px 22px;margin:0 0 18px;background:linear-gradient(115deg,#20354f,#253f5b);border-radius:10px;color:#fff;min-width:0}.heading{min-width:0}.title{font-size:28px;font-weight:750;line-height:1.2;margin:0;color:#fff;overflow-wrap:anywhere}.subtitle{font-size:15px;line-height:1.4;color:#d3e0ec;margin-top:4px}.close{flex:0 0 auto;min-height:48px;min-width:100px;padding:8px 12px;font:600 14px Arial,"Nimbus Sans",sans-serif;color:#fff;background:rgba(255,255,255,.06);border:1px solid #91a2b7;border-radius:6px;cursor:pointer}
@@ -7139,16 +7195,16 @@ div.st-key-drilldown_compact_header div.st-key-npi_dd_navigation [data-testid="s
                     <section class="card process-card"><h2 class="section-title">Process</h2><div class="process-stats"><div class="process-stat"><div class="label">Delay Days</div><div class="value">${esc(detail['Delay Days'])}</div></div><div class="process-stat"><div class="label">Aging</div><div class="value">${esc(detail.Aging)}</div></div><div class="process-stat date"><div class="label">First Process Plan</div><div class="value">${esc(detail['First Process Plan Date'])}</div></div></div><div class="routing-wrap"><table class="routing"><thead><tr><th class="step">Step</th><th style="width:31%">Operation</th><th>Plan Start</th><th>Actual Start</th></tr></thead><tbody>${routingRows}</tbody></table></div></section>
                     <section class="card action-card"><h2 class="section-title">Commitment & Remarks</h2><div class="action-form"><label>Owner<input type="text" id="detail-owner" placeholder="Enter owner" value="${esc(detail['Commitment Owner'] || '')}"></label><label>Commitment Date<input type="date" id="detail-commitment-date" value="${esc(detail['Commitment Date'] || '')}"></label><label class="remark-field">Remark<textarea id="detail-remark" rows="3" placeholder="Enter remark">${esc(detail['Commitment Remark'] || '')}</textarea></label></div><div class="action-actions"><button id="detail-save-commitment" class="save-commitment">Save Commitment</button><span id="detail-save-status" role="status"></span></div></section>
                     <section class="card information-card"><h2 class="section-title">Part Informations</h2><div class="grid">${field('PO Number',detail['PO Number'])}${field('Order Date',detail['Order Date'])}${field('Exwork Date',detail['Exwork Date'])}${field('Job Number',detail['Job Number'])}${field('Nesting Number',detail['Nesting Number'] === '' || detail['Nesting Number'] == null ? '' : (Number.isFinite(Number(detail['Nesting Number'])) ? String(Math.trunc(Number(detail['Nesting Number']))) : detail['Nesting Number']))}${field('Material',detail.Material)}${field('Plating',detail.Plating)}${field('Finishing',detail.Finishing)}${field('Subpart 2D Rev',detail['Subpart 2D Rev'])}${field('Subpart 3D Rev',detail['Subpart 3D Rev'])}${field('Subpart KK Rev',detail['Subpart KK Rev'])}</div></section>
-                    </section></main></body></html>`);
-                    popup.document.close();
-                    popup.npiCommitmentBridge = window.parent;
-                    const popupScript = popup.document.createElement('script');
-                    popupScript.textContent = '(' + npiPopupMain.toString() + ')(' + JSON.stringify({
-                        bridge_id: popupBridgeId,
-                        popup_id: makeRequestId(),
-                        part_key: String(detail['Commitment Part Key'] || detail['Part Number'] || '').trim()
-                    }) + ');';
-                    popup.document.body.appendChild(popupScript);
+                    </section></main>${runtimeScript}</body></html>`;
+                    const popupURL=URL.createObjectURL(new Blob([popupHTML],{type:'text/html;charset=utf-8'}));
+                    let popup;
+                    try{
+                        popup=desktopPopup ? window.open(popupURL,'_blank',popupFeatures) : window.open(popupURL,'_blank');
+                    }catch(e){URL.revokeObjectURL(popupURL);throw e;}
+                    if(!popup){
+                        URL.revokeObjectURL(popupURL);
+                        alert('Part Detail pop-up was blocked by your browser. Please allow pop-ups for this app and click the row again.');
+                    }
                 });
             });
             if (saveButton) saveButton.addEventListener('click', function () {

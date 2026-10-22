@@ -639,73 +639,84 @@ def normalize_part_number(value):
     return safe_text(value).strip().casefold()
 
 
-def build_delay_commitment_status_map(unique_df, actions_df, control_date):
-    """Map each delayed unique part in the current customer scope to its commitment status.
+def _delay_commitment_today():
+    """Malaysia calendar date, evaluated afresh on every dashboard rendering."""
+    return pd.Timestamp.now(tz="Asia/Kuala_Lumpur").date()
 
-    The unique-part dataset remains the source of truth. A delayed part without an
-    action record or commitment date is classified as NO COMMITMENT. Completed
-    actions are excluded from the four open-commitment tiles.
+
+def _delay_commitment_red_parts(unique_df):
+    """Select only the already-resolved outstanding RED representatives."""
+    if not isinstance(unique_df, pd.DataFrame):
+        return pd.DataFrame()
+    class_col = first_existing_column(unique_df, ["CALC_CLASSIFICATION", "CLASSIFICATION"])
+    if not class_col or "Subpart Part Num" not in unique_df.columns:
+        return unique_df.iloc[0:0]
+    return unique_df[
+        unique_df[class_col].fillna("").astype(str).str.strip().str.upper().isin(
+            {"RED - ENGINEERING", "RED - PROCESS", "RED - PRODUCTION"}
+        )
+    ]
+
+
+def _delay_commitment_date(value):
+    """Supabase DATE values are ISO calendar dates; invalid inputs stay missing."""
+    from datetime import date, datetime
+    if isinstance(value, str):
+        text = value.strip()
+        if len(text) != 10 or text[4] != "-" or text[7] != "-":
+            return None
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
+    if isinstance(value, datetime):
+        return None if pd.isna(value) else value.date()
+    if isinstance(value, date):
+        return None if pd.isna(value) else value
+    return None
+
+
+def build_delay_commitment_status_map(unique_df, commitment_lookup, today):
+    """One status per exact Subpart Part Num, using Latest Commitments only.
+
+    `today` is supplied by the Malaysia clock at the production call site; it is
+    independent of the dashboard's selected/displayed Control Date.
     """
+    if not isinstance(commitment_lookup, dict):
+        raise TypeError("Latest Commitments must be a bulk-read mapping.")
     status_map = {}
-    if not isinstance(unique_df, pd.DataFrame) or unique_df.empty:
-        return status_map
-
-    part_col = first_existing_column(
-        unique_df,
-        ["PART NUMBER", "Part Number", "Subpart Part Num", "PART", "Part"],
-    )
-    if not part_col:
-        return status_map
-
-    work_df = unique_df.copy()
-    class_col = first_existing_column(
-        work_df,
-        ["CALC_CLASSIFICATION", "CLASSIFICATION"],
-    )
-    if class_col:
-        work_df = work_df[
-            work_df[class_col].fillna("").astype(str).str.strip().str.upper().isin(
-                {"RED - ENGINEERING", "RED - PROCESS", "RED - PRODUCTION"}
-            )
-        ].copy()
-
-    action_status_by_part = {}
-    if isinstance(actions_df, pd.DataFrame) and not actions_df.empty:
-        action_part_col = first_existing_column(
-            actions_df,
-            ["PART_NUMBER", "Part Number", "PART NUMBER", "Subpart Part Num"],
-        )
-        commitment_date_col = first_existing_column(
-            actions_df,
-            ["COMMITMENT_DATE", "Commitment Date"],
-        )
-        action_status_col = first_existing_column(
-            actions_df,
-            ["ACTION_STATUS", "Action Status", "STATUS", "Commitment Status"],
-        )
-        if action_part_col:
-            for _, action_row in actions_df.iterrows():
-                part_key = normalize_part_number(action_row.get(action_part_col, ""))
-                if not part_key:
-                    continue
-                status = calculate_commitment_status(
-                    action_row.get(commitment_date_col, "") if commitment_date_col else "",
-                    action_row.get(action_status_col, "") if action_status_col else "",
-                    control_date,
-                )
-                # Keep the last stored record for a part, matching the existing drilldown/export lookup.
-                action_status_by_part[part_key] = status
-
-    allowed_statuses = {"OVERDUE", "DUE TODAY", "UPCOMING", "NO COMMITMENT"}
-    for part_value in work_df[part_col].tolist():
-        part_key = normalize_part_number(part_value)
+    for value in _delay_commitment_red_parts(unique_df).get("Subpart Part Num", []):
+        part_key = safe_text(value).strip()
         if not part_key:
             continue
-        status = action_status_by_part.get(part_key, "NO COMMITMENT")
-        if status in allowed_statuses:
-            status_map[part_key] = status
-
+        commitment = _delay_commitment_date(
+            (commitment_lookup.get(part_key) or {}).get("commitment_date")
+        )
+        if commitment is None:
+            status = "NO COMMITMENT"
+        elif commitment < today:
+            status = "OVERDUE"
+        elif commitment == today:
+            status = "DUE TODAY"
+        else:
+            status = "UPCOMING"
+        status_map[part_key] = status
     return status_map
+
+
+def _load_delay_commitment_status_map(unique_df):
+    """One authenticated bulk invocation per render; no cross-rerun date/data cache."""
+    keys = list(dict.fromkeys(
+        safe_text(value).strip()
+        for value in _delay_commitment_red_parts(unique_df).get("Subpart Part Num", [])
+        if safe_text(value).strip()
+    ))
+    if not keys:
+        return {}
+    latest = get_supabase_commitments(
+        keys, user_id=safe_text(st.session_state.get("npi_user_id")).strip()
+    )
+    return build_delay_commitment_status_map(unique_df, latest, _delay_commitment_today())
 
 
 def _run_enquiry_search():
@@ -2338,6 +2349,7 @@ def render_executive_status(
     unique_df,
     delay_bucket_summary=None,
     hotspot_df=None,
+    commitment_status_map=None,
 ):
     """
     TOP-01 EXECUTIVE STATUS
@@ -2788,11 +2800,6 @@ def render_executive_status(
     # 6D. DELAY COMMITMENT TILES
     # ============================================================
 
-    commitment_status_map = build_delay_commitment_status_map(
-        df,
-        st.session_state.get("actions_df"),
-        pd.Timestamp.today().normalize(),
-    )
     commitment_status_order = [
         "OVERDUE",
         "DUE TODAY",
@@ -2808,7 +2815,8 @@ def render_executive_status(
     selected_commitment_status = st.session_state.get("selected_commitment_status", "")
     commitment_tiles_html = ""
     for commitment_status in commitment_status_order:
-        count = sum(1 for item_status in commitment_status_map.values() if item_status == commitment_status)
+        count = (sum(1 for item_status in commitment_status_map.values() if item_status == commitment_status)
+                 if commitment_status_map is not None else None)
         tile_bg, tile_border, tile_accent, icon_text = commitment_status_styles[commitment_status]
         selected_class = " is-selected" if selected_commitment_status == commitment_status else ""
         bridge_text = "DELAY COMMITMENT BRIDGE " + commitment_status
@@ -2820,7 +2828,7 @@ def render_executive_status(
                     style="--commitment-bg:{tile_bg};--commitment-border:{tile_border};--commitment-accent:{tile_accent};">
                 <span class="npi-commitment-icon">{icon_text}</span>
                 <span class="npi-commitment-label">{html.escape(commitment_status)}</span>
-                <span class="npi-commitment-count">{count:,}</span>
+                <span class="npi-commitment-count">{f"{count:,}" if count is not None else "—"}</span>
                 <span class="npi-commitment-unit">PARTS</span>
             </button>
         """
@@ -8072,11 +8080,20 @@ div.st-key-npi_main_header [data-testid="stElementContainer"] { flex:0 0 auto !i
     ].copy()
     hotspot = build_production_hotspot(production_df)
 
+    # Both tiles and their Drilldown consume this one fresh, customer-scoped map.
+    # Read failures are unavailable, not four false counts or missing commitments.
+    try:
+        commitment_status_map = _load_delay_commitment_status_map(tower_unique)
+    except Exception:
+        commitment_status_map = None
+        st.warning("Delay Commitment is unavailable: unable to read Latest Commitments. Refresh to retry.")
+
     # Executive Status, Delay Bucket and Production Hotspot share one floating/resizable stage.
     render_executive_status(
         tower_unique,
         delay_bucket_summary=delay_bucket_summary,
         hotspot_df=hotspot,
+        commitment_status_map=commitment_status_map,
     )
 
     # The floating dashboard now ends at a draggable boundary. Do not add
@@ -8099,22 +8116,14 @@ div.st-key-npi_main_header [data-testid="stElementContainer"] { flex:0 0 auto !i
 
     selected_commitment_status = st.session_state.get("selected_commitment_status", "")
     if selected_commitment_status:
-        commitment_status_map = build_delay_commitment_status_map(
-            tower_unique,
-            st.session_state.get("actions_df"),
-            control_date,
-        )
         matching_commitment_parts = {
-            part_key for part_key, status in commitment_status_map.items()
+            part_key for part_key, status in (commitment_status_map or {}).items()
             if status == selected_commitment_status
         }
-        commitment_part_col = first_existing_column(
-            drill_df,
-            ["PART NUMBER", "Part Number", "Subpart Part Num", "PART", "Part"],
-        )
+        commitment_part_col = "Subpart Part Num" if "Subpart Part Num" in drill_df.columns else None
         if commitment_part_col and matching_commitment_parts:
             drill_df = drill_df[
-                drill_df[commitment_part_col].map(normalize_part_number).isin(
+                drill_df[commitment_part_col].map(lambda value: safe_text(value).strip()).isin(
                     matching_commitment_parts
                 )
             ].copy()
